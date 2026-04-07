@@ -27,7 +27,18 @@ from user_stories.framework import (
 )
 
 
-_DENY_KEYWORDS = ("access denied", "outside", "cannot access", "not allowed", "restricted")
+_DENY_KEYWORDS = (
+    "access denied",
+    "outside",
+    "cannot access",
+    "not allowed",
+    "restricted",
+    "can only access",
+    "only access",
+    "base directory",
+    "within the carpenter",
+    "carpenter directory",
+)
 
 
 class FilesystemAccessRestricted(AcceptanceStory):
