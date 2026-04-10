@@ -8,12 +8,15 @@ result in the same conversation — without the user sending another message.
 This tests the full arc-completion → chat-notification pipeline:
   1. User asks about weather.
   2. Chat agent creates untrusted arc batch (EXECUTOR + REVIEWER + JUDGE).
-  3. Arcs execute, fetching real weather data.
-  4. On completion, arc.chat_notify re-invokes the chat agent.
-  5. Chat agent reads arc results and delivers weather info to the user.
+  3. EXECUTOR fetches real weather data (encrypted in arc state).
+  4. REVIEWER decrypts content at platform level (not via LLM sandbox).
+  5. On completion, arc.chat_notify re-invokes the chat agent.
+  6. Chat agent reads arc results and delivers weather info to the user.
 
 The story passes when the conversation contains an assistant message with
-weather-related content (temperature, conditions, etc.) for Oxford.
+weather-related content (temperature, conditions, etc.) for Oxford.  It also
+verifies the response does NOT contain placeholder/empty data markers, which
+would indicate the REVIEWER failed to decrypt the EXECUTOR's content.
 
 Timeout: 300s (haiku), 300s (sonnet) — arc pipeline is multi-step.
 """
@@ -112,6 +115,21 @@ class WeatherQueryEndToEnd(AcceptanceStory):
         self.assert_that(
             any(kw in combined for kw in weather_keywords),
             "Response does not contain weather-related information",
+            response_preview=combined[:800],
+        )
+
+        # Must NOT contain placeholder/empty data markers — this catches
+        # the bug where the REVIEWER couldn't decrypt fetched content and
+        # returned empty summaries.
+        placeholder_markers = (
+            "not available", "n/a", "not specified",
+            "{'value': none}", "data couldn't be parsed",
+        )
+        has_placeholder = any(m in combined for m in placeholder_markers)
+        self.assert_that(
+            not has_placeholder,
+            "Response contains placeholder/empty data — fetch pipeline "
+            "may not be decrypting content correctly",
             response_preview=combined[:800],
         )
 
