@@ -45,46 +45,49 @@ class ExternalRepoSetup(AcceptanceStory):
     )
 
     @staticmethod
-    def _clear_forgejo_config(client: CarpenterClient) -> tuple[str, str] | None:
-        """Remove FORGEJO_TOKEN from .env and forgejo_url/git_server_url from config.yaml.
+    def _clear_git_config(client: CarpenterClient) -> tuple[str, str] | None:
+        """Remove GIT_TOKEN/FORGEJO_TOKEN from .env and git_url/forgejo_url/git_server_url from config.yaml.
 
         This ensures the agent will ask for credentials via the intake flow
         rather than using previously stored configuration.
 
-        Accepts either the legacy ``forgejo_url`` key or the newer
-        ``git_server_url`` key so this story remains compatible across the
-        carpenter-config rename.
+        Accepts the canonical ``git_url`` key plus the legacy
+        ``forgejo_url`` and intermediate ``git_server_url`` names, so this
+        story remains compatible across the carpenter-config rename
+        cutover.  The carpenter-core on-disk migration will eventually
+        leave only ``git_url`` on disk, but during the rollout we may
+        encounter any of the three.
 
         Returns a (key_name, value) tuple for restoration later, or None.
         """
         base_dir = Path.home() / "carpenter"
 
-        # Clear FORGEJO_TOKEN from .env
+        # Clear GIT_TOKEN / FORGEJO_TOKEN from .env
         dot_env = base_dir / ".env"
         if dot_env.is_file():
             lines = dot_env.read_text().splitlines()
             new_lines = [
                 ln for ln in lines
-                if not re.match(r'^FORGEJO_TOKEN\s*=', ln.strip())
+                if not re.match(r'^(GIT_TOKEN|FORGEJO_TOKEN)\s*=', ln.strip())
             ]
             if len(new_lines) != len(lines):
                 dot_env.write_text("\n".join(new_lines) + "\n")
-                print("  Cleared FORGEJO_TOKEN from .env")
+                print("  Cleared GIT_TOKEN/FORGEJO_TOKEN from .env")
 
-        # Clear forgejo_url / git_server_url from config.yaml
-        original_forgejo_url: tuple[str, str] | None = None
+        # Clear git_url / forgejo_url / git_server_url from config.yaml
+        original_git_url: tuple[str, str] | None = None
         config_yaml = base_dir / "config" / "config.yaml"
         if config_yaml.is_file():
             cfg_text = config_yaml.read_text()
             match = re.search(
-                r'^(forgejo_url|git_server_url):\s*(.+)$',
+                r'^(git_url|forgejo_url|git_server_url):\s*(.+)$',
                 cfg_text, re.MULTILINE,
             )
             if match:
                 key_name = match.group(1)
-                original_forgejo_url = (key_name, match.group(2).strip())
+                original_git_url = (key_name, match.group(2).strip())
                 cfg_text = re.sub(
-                    r'^(forgejo_url|git_server_url):\s*.+$',
+                    r'^(git_url|forgejo_url|git_server_url):\s*.+$',
                     f'# {key_name}: (cleared by S015)',
                     cfg_text, flags=re.MULTILINE,
                 )
@@ -100,18 +103,18 @@ class ExternalRepoSetup(AcceptanceStory):
         except Exception:
             pass  # best-effort
 
-        return original_forgejo_url
+        return original_git_url
 
     @staticmethod
-    def _restore_forgejo_url(
+    def _restore_git_url(
         client: CarpenterClient, saved: tuple[str, str],
     ) -> None:
         """Restore the original git server URL key in config.yaml after the test.
 
         ``saved`` is the (key_name, value) tuple returned by
-        :meth:`_clear_forgejo_config`; the original key name (``forgejo_url``
-        or ``git_server_url``) is written back so the file matches its
-        pre-test form.
+        :meth:`_clear_git_config`; the original key name (``git_url``,
+        ``forgejo_url`` or ``git_server_url``) is written back so the file
+        matches its pre-test form.
         """
         key_name, url = saved
         base_dir = Path.home() / "carpenter"
@@ -120,7 +123,7 @@ class ExternalRepoSetup(AcceptanceStory):
         if config_yaml.is_file():
             cfg_text = config_yaml.read_text()
             cfg_text = re.sub(
-                r'^#\s*(forgejo_url|git_server_url):.*$',
+                r'^#\s*(git_url|forgejo_url|git_server_url):.*$',
                 f'{key_name}: {url}',
                 cfg_text, flags=re.MULTILINE,
             )
@@ -151,20 +154,20 @@ class ExternalRepoSetup(AcceptanceStory):
 
         start_ts = time.time()
 
-        # ── Step 0: Clear Forgejo config so agent asks for credentials ──
-        # Previous runs store the token in Carpenter's .env and forgejo_url in
-        # config.yaml. Remove both so the agent triggers the credential
-        # intake flow. Restore forgejo_url at the end.
-        saved_forgejo_url = self._clear_forgejo_config(client)
+        # ── Step 0: Clear git server config so agent asks for credentials ──
+        # Previous runs store the token in Carpenter's .env and the git
+        # server URL in config.yaml. Remove both so the agent triggers the
+        # credential intake flow. Restore the git URL at the end.
+        saved_git_url = self._clear_git_config(client)
 
         try:
             return self._run_credential_flow(
                 client, forgejo_url, forgejo_token, repo_url, start_ts,
             )
         finally:
-            # Always restore forgejo_url so S016/S017 can use it
-            if saved_forgejo_url:
-                self._restore_forgejo_url(client, saved_forgejo_url)
+            # Always restore the git URL so S016/S017 can use it
+            if saved_git_url:
+                self._restore_git_url(client, saved_git_url)
 
     def _run_credential_flow(
         self,
@@ -195,8 +198,12 @@ class ExternalRepoSetup(AcceptanceStory):
         # ── Step 2: Find credential requests and submit values ───────────
         # Poll for credential requests — the agent may create them
         # asynchronously via a background arc.  Provide the right value
-        # for each key (URL for FORGEJO_URL, token for FORGEJO_TOKEN).
+        # for each key.  Carry both canonical names (GIT_*) and legacy
+        # names (FORGEJO_*) so we can satisfy whichever the agent asks
+        # for during the rename cutover.
         credential_values = {
+            "GIT_URL": forgejo_url,
+            "GIT_TOKEN": forgejo_token,
             "FORGEJO_URL": forgejo_url,
             "FORGEJO_TOKEN": forgejo_token,
         }
@@ -238,12 +245,13 @@ class ExternalRepoSetup(AcceptanceStory):
 
         if not fulfilled_any:
             # Agent mentioned credentials but didn't create an intake
-            # request. Inject both values directly.
+            # request. Inject the token directly under the canonical
+            # GIT_TOKEN name.
             print("  No credential request found; injecting directly")
             base_dir = Path.home() / "carpenter"
             dot_env = base_dir / ".env"
             lines = dot_env.read_text().splitlines() if dot_env.is_file() else []
-            lines.append(f"FORGEJO_TOKEN={forgejo_token}")
+            lines.append(f"GIT_TOKEN={forgejo_token}")
             dot_env.write_text("\n".join(lines) + "\n")
             httpx.post(
                 f"{client.base_url}/api/credentials/reload-config",
