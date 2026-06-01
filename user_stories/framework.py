@@ -303,6 +303,212 @@ class CarpenterClient:
             f"(conversation {conversation_id})"
         )
 
+    # Patterns that indicate an "I'm still working" acknowledgement —
+    # NOT a substantive reply.  Stories that need to wait for a real
+    # answer (after a long-running background arc completes) should
+    # treat messages matching any of these as non-terminal.
+    ACK_PATTERNS: tuple[str, ...] = (
+        "in progress",
+        "is in progress",
+        "i'll wait",
+        "i will wait",
+        "i'll let you know",
+        "i will let you know",
+        "still working",
+        "still processing",
+        "still running",
+        "let me know when",
+        "wait for the result",
+        "wait for the fetch",
+        "wait for it to complete",
+        "once the fetch",
+        "once it completes",
+        "once it is complete",
+        "once it's complete",
+        "once it finishes",
+        "once it's done",
+        "once it is done",
+        "i've started",
+        "i have started",
+        "i've kicked off",
+        "i have kicked off",
+        "i've queued",
+        "i have queued",
+        "i've scheduled",
+        "i have scheduled",
+        "i've initiated",
+        "i have initiated",
+        "i've triggered",
+        "i have triggered",
+        "i've launched",
+        "i have launched",
+        "i've dispatched",
+        "i have dispatched",
+        "i'm fetching",
+        "i am fetching",
+        "fetching the",
+        "working on it",
+        "background",
+        "stand by",
+        "standby",
+        "just a moment",
+        "give me a moment",
+        "one moment",
+        "one sec",
+        "please wait",
+    )
+
+    @classmethod
+    def looks_like_ack(cls, text: str) -> bool:
+        """Return True if *text* looks like a non-substantive ack reply.
+
+        Used by stories that wait for a real answer after a background
+        arc completes (e.g. an untrusted-fetch pipeline). An ack
+        ("the fetch is in progress, i'll wait") satisfies the
+        ``wait_for_pending_to_clear`` contract but isn't the answer
+        the test is looking for.
+        """
+        if not text:
+            return True
+        low = text.lower()
+        return any(p in low for p in cls.ACK_PATTERNS)
+
+    def wait_for_non_ack_message(
+        self,
+        conversation_id: int,
+        after_index: int,
+        timeout: int = 300,
+        poll_interval: float = 5.0,
+        ack_patterns: tuple[str, ...] | None = None,
+    ) -> dict:
+        """Wait for an assistant message after *after_index* that isn't an ack.
+
+        Polls ``get_assistant_messages(conversation_id)`` and returns
+        the first message at index >= ``after_index`` whose content
+        does NOT match any ack pattern.
+
+        Args:
+            conversation_id: conversation to watch
+            after_index: only messages whose 0-based position in the
+                assistant-message list is >= this value are considered.
+                Pass ``len(get_assistant_messages(conv))`` BEFORE sending
+                the prompt (or right after, to skip the initial ack).
+            timeout: max seconds to wait
+            poll_interval: seconds between polls
+            ack_patterns: override ACK_PATTERNS for this call
+
+        Raises:
+            TimeoutError if no non-ack message appears in time.
+        """
+        deadline = time.monotonic() + timeout
+        patterns = ack_patterns if ack_patterns is not None else self.ACK_PATTERNS
+
+        def _is_ack(text: str) -> bool:
+            if not text:
+                return True
+            low = text.lower()
+            return any(p in low for p in patterns)
+
+        last_msgs: list[dict] = []
+        while time.monotonic() < deadline:
+            msgs = self.get_assistant_messages(conversation_id)
+            last_msgs = msgs
+            for m in msgs[after_index:]:
+                if not _is_ack(m["content"]):
+                    return m
+            time.sleep(poll_interval)
+
+        # One last check after the loop
+        msgs = self.get_assistant_messages(conversation_id)
+        for m in msgs[after_index:]:
+            if not _is_ack(m["content"]):
+                return m
+
+        preview_msgs = [
+            m["content"][:120].replace("\n", " ")
+            for m in last_msgs[after_index:]
+        ]
+        raise TimeoutError(
+            f"No non-ack assistant message after index {after_index} "
+            f"within {timeout}s (conversation {conversation_id}). "
+            f"Saw {len(last_msgs) - after_index} ack-only messages: "
+            f"{preview_msgs!r}"
+        )
+
+    def wait_for_message_matching(
+        self,
+        conversation_id: int,
+        after_index: int,
+        keywords: tuple[str, ...] | list[str],
+        timeout: int = 300,
+        poll_interval: float = 5.0,
+        min_chars: int = 0,
+        require_all: bool = False,
+    ) -> dict:
+        """Wait for an assistant message after *after_index* containing keyword(s).
+
+        Useful when a single chat turn produces several intermediate
+        messages (the agent narrating its work) before delivering a
+        final substantive reply. By polling for keyword presence
+        directly we avoid both the ack-pattern false-negative and the
+        race-against-pending-clear failure mode.
+
+        Args:
+            conversation_id: conversation to watch
+            after_index: only messages whose 0-based position in the
+                assistant-message list is >= this value are considered.
+            keywords: case-insensitive substrings to look for
+            timeout: max seconds to wait
+            poll_interval: seconds between polls
+            min_chars: minimum content length to qualify (filters short
+                "let me check X" intermediate messages)
+            require_all: if True, all keywords must appear; default
+                is any-of
+
+        Returns:
+            The first (oldest) qualifying message in the new tail.
+        Raises:
+            TimeoutError if no matching message appears in time.
+        """
+        deadline = time.monotonic() + timeout
+        kws_low = [k.lower() for k in keywords]
+
+        def _matches(text: str) -> bool:
+            if not text or len(text) < min_chars:
+                return False
+            low = text.lower()
+            if require_all:
+                return all(k in low for k in kws_low)
+            return any(k in low for k in kws_low)
+
+        last_msgs: list[dict] = []
+        while time.monotonic() < deadline:
+            msgs = self.get_assistant_messages(conversation_id)
+            last_msgs = msgs
+            for m in msgs[after_index:]:
+                if _matches(m["content"]):
+                    return m
+            time.sleep(poll_interval)
+
+        # Final check after loop
+        msgs = self.get_assistant_messages(conversation_id)
+        for m in msgs[after_index:]:
+            if _matches(m["content"]):
+                return m
+
+        preview_msgs = [
+            m["content"][:200].replace("\n", " ")
+            for m in last_msgs[after_index:]
+        ]
+        raise TimeoutError(
+            f"No assistant message matching keywords {list(keywords)!r} "
+            f"(min_chars={min_chars}, require_all={require_all}) "
+            f"after index {after_index} within {timeout}s "
+            f"(conversation {conversation_id}). "
+            f"Saw {len(last_msgs) - after_index} non-matching messages: "
+            f"{preview_msgs!r}"
+        )
+
     def submit_review_decision(
         self,
         review_id: str,
@@ -410,6 +616,92 @@ class DBInspector:
         )
         return self._query(
             "SELECT * FROM arcs WHERE created_at >= ? ORDER BY id", (since_iso,)
+        )
+
+    # Arc statuses that are terminal — no further work will happen on
+    # the arc once it reaches one of these.
+    TERMINAL_ARC_STATUSES: tuple[str, ...] = (
+        "completed", "failed", "cancelled", "rejected",
+    )
+
+    def get_root_arcs_for_conversation(
+        self, conversation_id: int, since_ts: float | None = None,
+    ) -> list[dict]:
+        """Return root arcs (parent_id IS NULL) linked to a conversation.
+
+        Uses the ``conversation_arcs`` join table. Optionally filters to
+        arcs created at/after ``since_ts``.
+        """
+        if since_ts is not None:
+            since_iso = datetime.fromtimestamp(
+                since_ts, tz=timezone.utc
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            return self._query(
+                "SELECT a.* FROM arcs a "
+                "JOIN conversation_arcs ca ON ca.arc_id = a.id "
+                "WHERE ca.conversation_id = ? "
+                "AND a.parent_id IS NULL "
+                "AND a.created_at >= ? "
+                "ORDER BY a.id",
+                (conversation_id, since_iso),
+            )
+        return self._query(
+            "SELECT a.* FROM arcs a "
+            "JOIN conversation_arcs ca ON ca.arc_id = a.id "
+            "WHERE ca.conversation_id = ? AND a.parent_id IS NULL "
+            "ORDER BY a.id",
+            (conversation_id,),
+        )
+
+    def wait_for_arcs_terminal(
+        self,
+        arc_ids: list[int] | set[int],
+        timeout: int = 300,
+        poll_interval: float = 5.0,
+    ) -> dict[int, str]:
+        """Block until every arc in ``arc_ids`` reaches a terminal status.
+
+        Returns a dict ``{arc_id: status}`` once all are terminal. If
+        the deadline expires before all are terminal, raises
+        ``TimeoutError`` with the still-pending arcs listed.
+        """
+        ids = list(arc_ids)
+        if not ids:
+            return {}
+        deadline = time.monotonic() + timeout
+        placeholders = ",".join("?" * len(ids))
+        last_pending: list[dict] = []
+        while time.monotonic() < deadline:
+            rows = self._query(
+                f"SELECT id, status, name FROM arcs WHERE id IN ({placeholders})",
+                tuple(ids),
+            )
+            pending = [
+                r for r in rows
+                if r["status"] not in self.TERMINAL_ARC_STATUSES
+            ]
+            last_pending = pending
+            if not pending:
+                return {r["id"]: r["status"] for r in rows}
+            time.sleep(poll_interval)
+
+        rows = self._query(
+            f"SELECT id, status, name FROM arcs WHERE id IN ({placeholders})",
+            tuple(ids),
+        )
+        pending = [
+            r for r in rows
+            if r["status"] not in self.TERMINAL_ARC_STATUSES
+        ]
+        if not pending:
+            return {r["id"]: r["status"] for r in rows}
+        pending_descr = [
+            f"#{r['id']} {r['name'][:30]!r} status={r['status']}"
+            for r in pending
+        ]
+        raise TimeoutError(
+            f"{len(pending)} arc(s) still non-terminal after {timeout}s: "
+            f"{pending_descr}"
         )
 
     def get_arc_history(self, arc_id: int) -> list[dict]:
