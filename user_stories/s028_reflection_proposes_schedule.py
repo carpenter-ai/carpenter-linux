@@ -38,8 +38,17 @@ _WEATHER_PROMPT_1 = (
 
 _WEATHER_PROMPT_2 = (
     "What's the weather like today? I find myself asking you this every "
-    "morning. Is there a way you could just tell me automatically?"
+    "morning. Is there a way you could just tell me automatically? "
+    "If you do set up a scheduled weather check, please name the cron "
+    "entry starting with `s028-` (for example `s028-morning-weather`) "
+    "so it's easy to identify as a test artifact."
 )
+
+# Cleanup only deletes cron_entries rows whose name starts with this prefix.
+# Previously this story matched '%weather%' which was far too broad — it
+# would wipe sibling test runs' weather crons and any user schedule that
+# happened to mention weather.
+_CRON_NAME_PREFIX = "s028-"
 
 
 class ReflectionProposesSchedule(AcceptanceStory):
@@ -93,12 +102,14 @@ class ReflectionProposesSchedule(AcceptanceStory):
             response_preview=resp2[:600],
         )
 
-        # Check for cron entries in DB if available
+        # Check for cron entries in DB if available.
+        # Scoped to our story-specific prefix so we don't confuse a sibling
+        # run's or pre-existing weather cron for a story artifact.
         cron_created = False
         if db is not None:
             crons = db._query(
-                "SELECT * FROM cron_entries WHERE name LIKE '%weather%' "
-                "AND enabled = 1"
+                "SELECT * FROM cron_entries WHERE name LIKE ? AND enabled = 1",
+                (f"{_CRON_NAME_PREFIX}%",),
             )
             if crons:
                 cron_created = True
@@ -115,7 +126,13 @@ class ReflectionProposesSchedule(AcceptanceStory):
         )
 
     def cleanup(self, client: CarpenterClient, db: "DBInspector | None") -> None:
-        """Remove any weather-related cron entries."""
+        """Remove cron entries this story created (scoped to s028- prefix).
+
+        The old implementation matched '%weather%' which wiped sibling-run
+        artifacts and any user weather schedule.  The Phase-2 prompt now
+        asks the agent to prefix its cron name with 's028-', so cleanup
+        can filter safely.
+        """
         if db is None:
             return
         import sqlite3
@@ -123,10 +140,14 @@ class ReflectionProposesSchedule(AcceptanceStory):
             conn = sqlite3.connect(db.db_path)
             try:
                 cur = conn.execute(
-                    "DELETE FROM cron_entries WHERE name LIKE '%weather%'"
+                    "DELETE FROM cron_entries WHERE name LIKE ?",
+                    (f"{_CRON_NAME_PREFIX}%",),
                 )
                 if cur.rowcount:
-                    print(f"  [cleanup] Removed {cur.rowcount} weather cron(s)")
+                    print(
+                        f"  [cleanup] Removed {cur.rowcount} cron(s) "
+                        f"matching '{_CRON_NAME_PREFIX}%'"
+                    )
                 conn.commit()
             finally:
                 conn.close()

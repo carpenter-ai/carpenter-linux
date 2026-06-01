@@ -1,11 +1,17 @@
 """
 S048 — Skill KB Review Workflow Triggers on Agent Write
 
-When an agent writes to a KB entry under the `skills/` path, the platform
-automatically triggers a `skill-kb-review` template workflow.  This story
-verifies the end-to-end review pipeline for a **clean** (untainted) source:
+When an agent writes a skill entry into the knowledge base, the platform
+automatically triggers a `skill-kb-review` template workflow. This story
+verifies the end-to-end review pipeline for a **clean** (untainted) source.
 
-1. Agent creates a KB entry at `skills/test-review-workflow` (via submit_code).
+The user, in natural language, asks the agent to record a new skill into
+its long-term knowledge — a small note about how to verify the review
+workflow itself. The agent has to figure out where in the KB skill notes
+live and save the entry there. The platform then auto-triggers the
+review pipeline:
+
+1. Agent creates a skill KB entry (via submit_code).
 2. Platform triggers the skill-kb-review template (4 child arcs).
 3. classify-source auto-completes (clean source).
 4. text-review auto-passes (clean source).
@@ -34,14 +40,10 @@ from user_stories.framework import (
     CarpenterClient,
 )
 
-_KB_PATH = "skills/test-review-workflow"
-
 _CREATE_PROMPT = (
-    "Please create a new knowledge base entry at "
-    "'skills/test-review-workflow'. The entry should contain a short note "
-    "about testing: 'This is a test entry to verify the skill-KB review "
-    "workflow triggers correctly when writing to the skills/ path.'\n"
-    "Save it permanently."
+    "Could you make a small skill note in your knowledge base about "
+    "verifying the skill-review workflow? Just a sentence or two — "
+    "something the future-you can look up later. Save it for keeps."
 )
 
 
@@ -58,7 +60,7 @@ class SkillKbReviewWorkflow(AcceptanceStory):
         start_ts = time.time()
 
         # ── Step 1: Ask agent to create the KB entry ────────────────────
-        print(f"\n  [1/3] Sending KB-creation request for '{_KB_PATH}'...")
+        print("\n  [1/3] Sending natural-language skill-note request...")
         conv_id = client.create_conversation()
         client.send_message(_CREATE_PROMPT, conv_id)
 
@@ -118,13 +120,19 @@ class SkillKbReviewWorkflow(AcceptanceStory):
         parent_id = review_parent["id"]
         print(f"  Found skill-kb-review parent arc #{parent_id}")
 
-        # Verify parent arc_state has the KB path
+        # Verify parent arc_state references a skills/* KB path —
+        # the agent picked the path itself, we just check it landed
+        # under the skills/ namespace (which is what triggers this
+        # review pipeline in the first place).
         parent_state = db.get_arc_state(parent_id)
+        kb_path = parent_state.get("kb_path") or ""
         self.assert_that(
-            parent_state.get("kb_path") == _KB_PATH,
-            f"Expected kb_path='{_KB_PATH}' in parent state, got {parent_state.get('kb_path')}",
+            isinstance(kb_path, str) and kb_path.startswith("skills/") and len(kb_path) > len("skills/"),
+            f"Expected kb_path under 'skills/' in parent state, got {kb_path!r}",
             parent_state=parent_state,
         )
+        # Stash the chosen path for cleanup later.
+        self._kb_path = kb_path
 
         # ── Step 3: Wait for the review pipeline to complete ────────────
         print("  [3/3] Waiting for review pipeline to complete (up to 180s)...")
@@ -197,7 +205,7 @@ class SkillKbReviewWorkflow(AcceptanceStory):
             name=self.name,
             passed=True,
             message=(
-                f"KB entry '{_KB_PATH}' created ✓, "
+                f"Skill KB entry '{kb_path}' created ✓, "
                 f"skill-kb-review arc #{parent_id} triggered ✓, "
                 f"4 child arcs all completed ✓, "
                 f"source classified clean ✓, "
@@ -210,13 +218,17 @@ class SkillKbReviewWorkflow(AcceptanceStory):
         if db is None:
             return
 
+        kb_path = getattr(self, "_kb_path", None)
+        if not kb_path:
+            return
+
         try:
             conn = sqlite3.connect(db.db_path)
             try:
-                conn.execute("DELETE FROM kb_entries WHERE path = ?", (_KB_PATH,))
-                conn.execute("DELETE FROM kb_links WHERE source_path = ?", (_KB_PATH,))
+                conn.execute("DELETE FROM kb_entries WHERE path = ?", (kb_path,))
+                conn.execute("DELETE FROM kb_links WHERE source_path = ?", (kb_path,))
                 conn.commit()
-                print(f"  [cleanup] Removed '{_KB_PATH}' from kb_entries table")
+                print(f"  [cleanup] Removed '{kb_path}' from kb_entries table")
             finally:
                 conn.close()
         except Exception as exc:
@@ -226,7 +238,7 @@ class SkillKbReviewWorkflow(AcceptanceStory):
         # DB entry on next server restart.
         import os
         base_dir = os.path.dirname(os.path.dirname(db.db_path))  # data/ -> config/kb
-        kb_file = os.path.join(base_dir, "config", "kb", _KB_PATH + ".md")
+        kb_file = os.path.join(base_dir, "config", "kb", kb_path + ".md")
         try:
             if os.path.exists(kb_file):
                 os.remove(kb_file)

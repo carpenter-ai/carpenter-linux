@@ -25,7 +25,7 @@ Your job is to:
 3. Common root causes and their fixes:
 
    Arc auto-dispatch not firing
-     → Check carpenter/core/arc_dispatch_handler.py
+     → Check carpenter/core/arcs/dispatch_handler.py
      → Check that it is registered in carpenter/api/http.py lifespan
      → Look for scan_for_ready_arcs() heartbeat registration
 
@@ -36,7 +36,7 @@ Your job is to:
        (See MEMORY.md — this is a documented recurring bug)
 
    Arcs stuck in 'pending' status
-     → arc_dispatch_handler.py may not be running
+     → carpenter/core/arcs/dispatch_handler.py may not be running
      → Or arcs have unmet predecessors (check step_order, parent completion)
 
    Agent not using messaging.send for chat messages from arcs
@@ -91,7 +91,10 @@ def _load_config() -> dict:
     """Assemble runtime config from env vars and config.yaml."""
     try:
         import yaml
-        cfg_path = Path.home() / "carpenter" / "config" / "config.yaml"
+        cfg_path = Path(os.environ.get(
+            "CARPENTER_CONFIG",
+            Path.home() / "carpenter" / "config" / "config.yaml"
+        ))
         file_cfg: dict = yaml.safe_load(cfg_path.read_text()) if cfg_path.exists() else {}
     except Exception:
         file_cfg = {}
@@ -239,6 +242,24 @@ def run_story(
         )
         _print_diagnostics(result, db)
         return result
+
+    except BaseException as exc:
+        # pytest.skip() raises pytest.outcomes.Skipped, which inherits
+        # from BaseException (not Exception). Catch it here so a story
+        # declaring an unmet prerequisite reports cleanly as a skip
+        # instead of crashing the whole runner.
+        if type(exc).__name__ == "Skipped":
+            duration = time.monotonic() - start
+            reason = str(exc)
+            print(f"\n  ⊝  SKIPPED: {reason}")
+            return StoryResult(
+                name=story.name,
+                passed=True,
+                skipped=True,
+                message=reason,
+                duration_s=duration,
+            )
+        raise
 
     except TimeoutError as exc:
         duration = time.monotonic() - start
@@ -392,21 +413,41 @@ def main() -> int:
     print(f"\n{'━'*70}")
     print("  SUMMARY")
     print(f"{'━'*70}")
-    passed = sum(1 for r in results if r.passed)
-    failed = len(results) - passed
+    skipped = sum(1 for r in results if r.skipped)
+    passed = sum(1 for r in results if r.passed and not r.skipped)
+    failed = sum(1 for r in results if not r.passed)
     for r in results:
-        icon = "✓" if r.passed else "✗"
+        if r.skipped:
+            icon = "⊝"
+        elif r.passed:
+            icon = "✓"
+        else:
+            icon = "✗"
         print(f"  {icon}  {r.name}  ({r.duration_s:.1f}s)")
-        if not r.passed:
+        if r.skipped and r.message:
+            print(f"       → skipped: {r.message}")
+        elif not r.passed:
             first_line = r.error.splitlines()[0] if r.error else "unknown"
             print(f"       → {first_line}")
     print()
-    print(f"  {passed}/{len(results)} passed" + ("  🎉" if failed == 0 else ""))
+    skip_suffix = f", {skipped} skipped" if skipped else ""
+    print(
+        f"  {passed}/{len(results) - skipped} passed"
+        f"{skip_suffix}"
+        + ("  🎉" if failed == 0 else "")
+    )
     print()
 
     _sweep_orphaned_workspaces(cfg["workspaces_dir"], run_start_time)
 
-    return 0 if failed == 0 else 1
+    if failed > 0:
+        return 1
+    # Exit code 77 is the autotools/Automake convention for "skipped",
+    # letting outer test runners (e.g., run-comprehensive-tests.sh)
+    # distinguish "not applicable" from "broken".
+    if skipped > 0 and passed == 0:
+        return 77
+    return 0
 
 
 if __name__ == "__main__":

@@ -1,10 +1,12 @@
 """
 S036 — Multiple Coding-Change Reviews Queued Simultaneously
 
-The user asks for TWO coding-changes at the same time: a word_frequency tool
-and a text_stats tool. Both reach the 'waiting' state with pending reviews.
-The KEY assertion is that two distinct review_ids exist simultaneously. The
-story approves one and revises the other, then approves the revision.
+The user asks for two small read-only text utilities at once (a word-
+frequency helper and a text-stats helper), described in natural language
+without naming file paths or tool conventions. Both reach the 'waiting'
+state with pending reviews. The KEY assertion is that two distinct
+review_ids exist simultaneously. The story approves one and revises the
+other, then approves the revision.
 
 Expected behaviour:
   1. User asks for both tools in a single message.
@@ -39,12 +41,12 @@ _TOOL_A = "word_frequency"
 _TOOL_B = "text_stats"
 
 _DUAL_PROMPT = (
-    "Please create two new read tools using the coding-change workflow:\n\n"
-    "1. 'word_frequency' in carpenter_tools/read/word_frequency.py — takes a "
-    "text string and returns a dict of word frequencies.\n\n"
-    "2. 'text_stats' in carpenter_tools/read/text_stats.py — takes a text "
-    "string and returns stats: character count, word count, sentence count.\n\n"
-    "Please work on both simultaneously using separate coding-change arcs."
+    "I'd like two small read-only text utilities, please work on both at once:\n\n"
+    "1. A 'word_frequency' helper that takes some text and returns a "
+    "breakdown of how often each word appears.\n\n"
+    "2. A 'text_stats' helper that takes some text and returns basic "
+    "counts: characters, words, sentences.\n\n"
+    "Get them both queued up for review in parallel."
 )
 
 _REVISE_TEXT_STATS = (

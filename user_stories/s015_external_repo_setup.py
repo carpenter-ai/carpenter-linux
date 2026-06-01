@@ -45,13 +45,17 @@ class ExternalRepoSetup(AcceptanceStory):
     )
 
     @staticmethod
-    def _clear_forgejo_config(client: CarpenterClient) -> str | None:
-        """Remove FORGEJO_TOKEN from .env and forgejo_url from config.yaml.
+    def _clear_forgejo_config(client: CarpenterClient) -> tuple[str, str] | None:
+        """Remove FORGEJO_TOKEN from .env and forgejo_url/git_server_url from config.yaml.
 
         This ensures the agent will ask for credentials via the intake flow
         rather than using previously stored configuration.
 
-        Returns the original forgejo_url value (for restoration later) or None.
+        Accepts either the legacy ``forgejo_url`` key or the newer
+        ``git_server_url`` key so this story remains compatible across the
+        carpenter-config rename.
+
+        Returns a (key_name, value) tuple for restoration later, or None.
         """
         base_dir = Path.home() / "carpenter"
 
@@ -67,20 +71,25 @@ class ExternalRepoSetup(AcceptanceStory):
                 dot_env.write_text("\n".join(new_lines) + "\n")
                 print("  Cleared FORGEJO_TOKEN from .env")
 
-        # Clear forgejo_url from config.yaml
-        original_forgejo_url = None
+        # Clear forgejo_url / git_server_url from config.yaml
+        original_forgejo_url: tuple[str, str] | None = None
         config_yaml = base_dir / "config" / "config.yaml"
         if config_yaml.is_file():
             cfg_text = config_yaml.read_text()
-            match = re.search(r'^forgejo_url:\s*(.+)$', cfg_text, re.MULTILINE)
+            match = re.search(
+                r'^(forgejo_url|git_server_url):\s*(.+)$',
+                cfg_text, re.MULTILINE,
+            )
             if match:
-                original_forgejo_url = match.group(1).strip()
+                key_name = match.group(1)
+                original_forgejo_url = (key_name, match.group(2).strip())
                 cfg_text = re.sub(
-                    r'^forgejo_url:\s*.+$', '# forgejo_url: (cleared by S015)',
+                    r'^(forgejo_url|git_server_url):\s*.+$',
+                    f'# {key_name}: (cleared by S015)',
                     cfg_text, flags=re.MULTILINE,
                 )
                 config_yaml.write_text(cfg_text)
-                print("  Cleared forgejo_url from config.yaml")
+                print(f"  Cleared {key_name} from config.yaml")
 
         # Tell the server to reload config
         try:
@@ -94,16 +103,25 @@ class ExternalRepoSetup(AcceptanceStory):
         return original_forgejo_url
 
     @staticmethod
-    def _restore_forgejo_url(client: CarpenterClient, url: str) -> None:
-        """Restore forgejo_url in config.yaml after the test."""
+    def _restore_forgejo_url(
+        client: CarpenterClient, saved: tuple[str, str],
+    ) -> None:
+        """Restore the original git server URL key in config.yaml after the test.
+
+        ``saved`` is the (key_name, value) tuple returned by
+        :meth:`_clear_forgejo_config`; the original key name (``forgejo_url``
+        or ``git_server_url``) is written back so the file matches its
+        pre-test form.
+        """
+        key_name, url = saved
         base_dir = Path.home() / "carpenter"
         config_yaml = base_dir / "config" / "config.yaml"
 
         if config_yaml.is_file():
             cfg_text = config_yaml.read_text()
             cfg_text = re.sub(
-                r'^#\s*forgejo_url:.*$',
-                f'forgejo_url: {url}',
+                r'^#\s*(forgejo_url|git_server_url):.*$',
+                f'{key_name}: {url}',
                 cfg_text, flags=re.MULTILINE,
             )
             config_yaml.write_text(cfg_text)

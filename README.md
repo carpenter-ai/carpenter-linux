@@ -1,11 +1,33 @@
-# carpenter-linux
+# Carpenter for Linux
 
-The Linux platform package for [Carpenter](https://github.com/carpenter-ai/carpenter) — a pure-Python AI agent platform where every action is reviewable code.
+Linux platform package for the [Carpenter](https://rainbow-forge.duckdns.org:3000/ben-harack/carpenter-core) AI agent platform.
 
-This package provides sandbox backends (subprocess, Docker, Landlock), network egress control, and the server entry point. It depends on [carpenter-core](https://github.com/carpenter-ai/carpenter-core).
+## What This Provides
 
-See [carpenter-ai.org](https://carpenter-ai.org/) for documentation.
+- **LinuxPlatform** -- process restart via `os.execv`, file protection, systemd service generation, graceful process termination
+- **Sandbox methods** -- Landlock, user/mount namespaces, bubblewrap, AppArmor (auto-detected at startup)
 
-## License
+## Deployment Targets
 
-[MIT](LICENSE)
+Both bare-metal (systemd) and Docker deployments are first-class targets and must be kept in sync. When new config keys are added to `carpenter-core`'s `config.py` DEFAULTS, update **both** `docker/config.yaml` and `install.sh` to match.
+
+## Usage
+
+```bash
+# Run directly (injects Linux platform into carpenter-core and starts the server)
+python3 -m carpenter_linux
+
+# Install as editable package
+pip install -e .
+```
+
+## Acceptance Tests
+
+47 end-to-end acceptance stories live in `user_stories/`. Run them against a live server:
+
+```bash
+python3 user_stories/runner.py          # all stories
+python3 user_stories/runner.py s001     # single story
+```
+
+See `user_stories/runner.py` header for environment variable configuration.

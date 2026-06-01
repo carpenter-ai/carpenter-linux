@@ -1,36 +1,36 @@
 """
-S040 — Ollama Tool Calling Smoke Test
+S040 — Ollama Tool Calling Smoke Test (per-conversation pin, naturalized)
 
-Focused acceptance test for tool calling against an Ollama instance (typically
-running on a desktop machine with a GPU for fast iteration).
+Tests that the agent can, on a natural user request, switch a SINGLE
+conversation over to an Ollama-protocol backend without touching the
+server's global ``ai_provider`` default, and then successfully call a
+tool on the new backend.
 
-Unlike S014/S039 which spin up a full local install, this story connects to
-a pre-existing Carpenter server configured to use Ollama as its AI provider.
-It tests whether small models (3B) can successfully use tools through the
-harness optimizations (ultra-core tool set, few-shot examples, validation,
-low temperature, KB prepopulation).
-
-Substories (in order):
-  1. Chat response — baseline: does the model respond at all?
-  2. KB search — send "What do you know about X?", verify model calls kb_search
-  3. File read — ask to read a known file, verify model calls read_file
+The story reaches the Ollama backend by asking the chat agent, via a
+natural prompt, to pin this conversation to a specific provider/model.
+That should invoke the ``set_conversation_model`` chat tool which
+writes to the ``conversations`` row (see KB article
+``ai/per-conversation-model``). The global config is NOT modified.
 
 Prerequisites:
-  - Desktop Ollama running (set OLLAMA_URL env var, e.g. http://<host>:11434)
-  - Model available: qwen2.5:3b-instruct-q4_K_M (or OLLAMA_MODEL env var)
-  - Carpenter server running with ai_provider=ollama and ollama_url configured
+  - The running Carpenter server has a reachable Ollama-protocol endpoint.
+    Configure ``ollama_url`` in ``config.yaml`` once; the story does NOT
+    assume the server's default provider is ollama.
+  - The model the agent should pin to must be supplied. The story
+    consults, in order: the ``OLLAMA_MODEL`` env var, then the
+    ``ollama_model`` key in ``config.yaml``. If neither is present
+    the story skips — the platform does not ship a default LLM.
 
 Usage:
-  # Run with default model (Qwen 2.5 3B)
-  python -m user_stories.runner --story s040
-
-  # Run with xLAM function-calling model
-  OLLAMA_MODEL="hf.co/Salesforce/xLAM-2-3b-fc-r-gguf:latest" \\
     python -m user_stories.runner --story s040
 """
 
 import os
+import sqlite3
 import time
+from pathlib import Path
+
+import pytest
 
 from user_stories.framework import (
     AcceptanceStory,
@@ -39,163 +39,285 @@ from user_stories.framework import (
     CarpenterClient,
 )
 
+_SWITCH_PROMPT_TEMPLATE = (
+    "For just THIS conversation, please switch us over to using the "
+    "Ollama model {model} running on my desktop. Keep the default "
+    "provider/model for other conversations unchanged — I don't want "
+    "you to edit config.yaml."
+)
 
-class _SlowModelClient(CarpenterClient):
-    """Client wrapper that scales timeouts for slower Ollama inference.
+# Second prompt: force a tool invocation on the new backend. We ask the
+# model to search the knowledge base — that maps cleanly to a single
+# ``kb_search`` tool call, which small tool-capable models (e.g.,
+# qwen3:8b) can handle in one step. Avoid asking for arithmetic: the
+# ultra-core tool set has no calculator, and the reviewer on
+# ``submit_code`` rejects trivial "print(...)" code, causing loops.
+_TOOL_PROMPT = (
+    "Great. Now please search your knowledge base for articles about "
+    "\"chat\" and tell me which articles you find. Use the knowledge "
+    "base tool to look this up rather than answering from memory."
+)
 
-    Desktop Ollama is much faster than Pi-local inference, so we use a
-    modest 5x multiplier (vs 15x in S014).
-    """
+# Timeout multiplier for slow Ollama inference.
+_TIMEOUT_MULT = 6
 
-    TIMEOUT_MULTIPLIER = 5
 
-    def is_pending(self, conversation_id: int) -> bool:
-        try:
-            return super().is_pending(conversation_id)
-        except Exception:
-            return True
+class _SlowClient(CarpenterClient):
+    """CarpenterClient with longer timeouts for Ollama backends."""
 
     def wait_for_pending_to_clear(
-        self, conversation_id: int, timeout: int = 60
+        self, conversation_id: int, timeout: int = 60, poll_interval: float = 0.5
     ) -> None:
-        scaled = timeout * self.TIMEOUT_MULTIPLIER
-        return super().wait_for_pending_to_clear(conversation_id, timeout=scaled)
+        return super().wait_for_pending_to_clear(
+            conversation_id, timeout=timeout * _TIMEOUT_MULT,
+            poll_interval=poll_interval,
+        )
 
     def wait_for_n_assistant_messages(
-        self,
-        conversation_id: int,
-        n: int,
-        timeout: int = 120,
+        self, conversation_id: int, n: int, timeout: int = 120,
+        poll_interval: float = 1.0,
     ) -> list[dict]:
-        scaled = timeout * self.TIMEOUT_MULTIPLIER
         return super().wait_for_n_assistant_messages(
-            conversation_id, n, timeout=scaled
+            conversation_id, n, timeout=timeout * _TIMEOUT_MULT,
+            poll_interval=poll_interval,
         )
 
 
 class OllamaToolCalling(AcceptanceStory):
-    name = "S040 — Ollama Tool Calling Smoke Test"
+    name = "S040 — Ollama per-conversation pin + tool calling"
     description = (
-        "Tests tool calling with small Ollama models (3B). "
-        "Verifies chat response, kb_search tool use, and read_file tool use."
+        "Asks the chat agent in natural language to switch THIS "
+        "conversation to an Ollama-protocol backend (no global config "
+        "change), then asks it to search the knowledge base. Verifies "
+        "the conversation override was recorded, the global config "
+        "was NOT touched, and kb_search was invoked on turn 2."
     )
+    timeout = 600
 
     def run(self, client: CarpenterClient, db: DBInspector) -> StoryResult:
         start_ts = time.time()
-        model = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b-instruct-q4_K_M")
-        print(f"\n  Model: {model}")
+        model = self._resolve_ollama_model()
+        if not model:
+            pytest.skip(
+                "requires OLLAMA_MODEL env var or ollama_model key in "
+                "config.yaml — the platform does not ship a default LLM"
+            )
+        print(f"\n  Target Ollama model: {model}")
 
-        # Wrap client with timeout scaling
-        slow_client = _SlowModelClient(
+        slow_client = _SlowClient(
             client.base_url,
             token=client._token,
             timeout=client._default_timeout,
         )
 
-        # ── Substory 1: Chat response (baseline) ─────────────────────────
-        print("\n  [1/3] Chat response baseline...")
-        conv_id, response = slow_client.chat(
-            "Hello! What can you do?",
+        # Snapshot global config (by content + mtime) so we can later
+        # assert the agent did NOT mutate it.
+        config_path = self._locate_config_yaml()
+        config_snapshot = None
+        if config_path is not None:
+            config_snapshot = (
+                config_path.stat().st_mtime_ns,
+                config_path.read_bytes(),
+            )
+            print(f"  Global config: {config_path} (snapshotted)")
+        self._config_path = config_path
+        self._config_snapshot = config_snapshot
+        self._conv_id: int | None = None
+
+        # ── Turn 1: ask the agent to pin this conversation ────────────
+        print("\n  [1/3] Asking agent to pin this conversation to Ollama...")
+        conv_id, resp1 = slow_client.chat(
+            _SWITCH_PROMPT_TEMPLATE.format(model=model),
             timeout=120,
         )
-        print(f"  Got response ({len(response)} chars, conversation {conv_id})")
+        self._conv_id = conv_id
+        print(f"  Turn 1 response ({len(resp1)} chars): {resp1[:240]!r}")
 
+        # Verify the override was actually recorded in the DB.
+        override_row = self._fetch_conv_override(db, conv_id)
+        print(f"  conversations row override: {override_row}")
         self.assert_that(
-            len(response) >= 20,
-            f"Chat response too short ({len(response)} chars); expected >= 20",
-            response_preview=response[:300],
+            override_row is not None,
+            f"Conversation #{conv_id} not found in DB after turn 1",
+        )
+        self.assert_that(
+            (override_row.get("ai_provider") or "").lower() == "ollama",
+            "Agent did not pin conversation to ollama. "
+            f"ai_provider={override_row.get('ai_provider')!r}",
+            response_preview=resp1[:400],
+        )
+        # Verify the pinned model matches what we asked for. We check
+        # for substring containment rather than equality to tolerate the
+        # agent normalizing the tag (e.g. ``qwen3:8b`` vs ``qwen3:8b-instruct``).
+        pinned_model = (override_row.get("model") or "").lower()
+        self.assert_that(
+            bool(pinned_model) and model.split(":")[0].lower() in pinned_model,
+            f"Agent did not pin to the requested model {model!r}. "
+            f"model={override_row.get('model')!r}",
+            response_preview=resp1[:400],
         )
 
-        # ── Substory 2: KB search ────────────────────────────────────────
-        print("\n  [2/3] KB search tool call...")
-        conv_id_kb, response_kb = slow_client.chat(
-            "What do you know about scheduling? "
-            "Please search your knowledge base to find out.",
-            timeout=180,
-        )
-        print(f"  Got response ({len(response_kb)} chars, conversation {conv_id_kb})")
-
-        # Check if kb_search was called by looking at tool_calls in DB
-        kb_search_called = self._check_tool_called(db, conv_id_kb, "kb_search")
-        if kb_search_called:
-            print("  kb_search tool was called successfully")
-        else:
-            # Check if the response mentions KB content anyway (from prepopulation)
-            has_kb_content = any(
-                kw in response_kb.lower()
-                for kw in ("knowledge base", "scheduling", "kb", "search")
+        # Verify global config NOT modified.
+        if config_snapshot is not None and config_path is not None:
+            after_mtime = config_path.stat().st_mtime_ns
+            after_bytes = config_path.read_bytes()
+            self.assert_that(
+                after_mtime == config_snapshot[0]
+                and after_bytes == config_snapshot[1],
+                "Global config.yaml was modified — the agent was "
+                "supposed to leave it alone and only pin THIS conversation.",
             )
-            if has_kb_content:
-                print("  kb_search not explicitly called, but KB content present "
-                      "(likely from prepopulation)")
-            else:
-                print("  WARNING: kb_search not called and no KB content in response")
+            print("  Global config.yaml unchanged — good.")
 
+        # ── Turn 2: ask for a tool-requiring computation ──────────────
+        print("\n  [2/3] Asking a tool-requiring question...")
+        tool_calls_before = self._count_tool_calls(db, conv_id)
+        _, resp2 = slow_client.chat(
+            _TOOL_PROMPT, conversation_id=conv_id, timeout=240,
+        )
+        print(f"  Turn 2 response ({len(resp2)} chars): {resp2[:300]!r}")
+
+        tool_calls_after = self._count_tool_calls(db, conv_id)
+        tool_calls_delta = tool_calls_after - tool_calls_before
+        print(f"  Tool calls during turn 2: {tool_calls_delta}")
         self.assert_that(
-            len(response_kb) >= 20,
-            f"KB search response too short ({len(response_kb)} chars)",
-            response_preview=response_kb[:300],
-            kb_search_called=kb_search_called,
+            tool_calls_delta >= 1,
+            "Turn 2 did not invoke any tools — the agent answered from "
+            "memory instead of using a tool as instructed.",
+            response_preview=resp2[:400],
         )
 
-        # ── Substory 3: File read ────────────────────────────────────────
-        print("\n  [3/3] File read tool call...")
-        conv_id_file, response_file = slow_client.chat(
-            "Please read the file at config.yaml and tell me what AI provider is configured.",
-            timeout=180,
+        # ── Turn 3: verify the tool was actually kb_search ────────────
+        print("\n  [3/3] Verifying kb_search was the tool invoked...")
+        kb_search_calls = self._count_tool_calls_by_name(
+            db, conv_id, "kb_search"
         )
-        print(f"  Got response ({len(response_file)} chars, conversation {conv_id_file})")
-
-        read_file_called = self._check_tool_called(db, conv_id_file, "read_file")
-        if read_file_called:
-            print("  read_file tool was called successfully")
-        else:
-            print("  WARNING: read_file not called")
-
         self.assert_that(
-            len(response_file) >= 20,
-            f"File read response too short ({len(response_file)} chars)",
-            response_preview=response_file[:300],
-            read_file_called=read_file_called,
+            kb_search_calls >= 1,
+            "Turn 2 invoked tools but none were kb_search — the model "
+            "reached for a different tool than asked.",
+            response_preview=resp2[:400],
         )
 
-        # ── Summary ──────────────────────────────────────────────────────
         duration = time.time() - start_ts
-        tools_called = sum([
-            1,  # chat baseline always passes if we get here
-            1 if kb_search_called else 0,
-            1 if read_file_called else 0,
-        ])
-
         return StoryResult(
             name=self.name,
             passed=True,
             message=(
-                f"Model: {model}, "
-                f"Tools called: {tools_called}/3 substories, "
-                f"kb_search={'yes' if kb_search_called else 'no'}, "
-                f"read_file={'yes' if read_file_called else 'no'}"
+                f"Pinned conv #{conv_id} to "
+                f"{override_row.get('ai_provider')}:{override_row.get('model')}; "
+                f"tool calls on turn 2: {tool_calls_delta}; "
+                f"global config unchanged."
             ),
             diagnostics={
-                "model": model,
-                "kb_search_called": kb_search_called,
-                "read_file_called": read_file_called,
-                "tools_called": tools_called,
+                "conversation_id": conv_id,
+                "override": override_row,
+                "tool_calls_turn2": tool_calls_delta,
             },
             duration_s=duration,
         )
 
-    @staticmethod
-    def _check_tool_called(
-        db: DBInspector, conversation_id: int, tool_name: str
-    ) -> bool:
-        """Check if a specific tool was called in a conversation."""
+    # ── Helpers ────────────────────────────────────────────────────────
+
+    @classmethod
+    def _resolve_ollama_model(cls) -> str | None:
+        """Find the Ollama model the user wants the agent to pin to.
+
+        Priority: ``OLLAMA_MODEL`` env var → ``ollama_model`` key in
+        the server's ``config.yaml``. Returns ``None`` if neither is
+        present — the platform ships no default LLM.
+        """
+        env_model = os.environ.get("OLLAMA_MODEL", "").strip()
+        if env_model:
+            return env_model
+        config_path = cls._locate_config_yaml()
+        if config_path is None:
+            return None
         try:
-            rows = db._query(
-                "SELECT COUNT(*) as cnt FROM tool_calls "
-                "WHERE conversation_id = ? AND tool_name = ?",
-                (conversation_id, tool_name),
-            )
-            return rows[0]["cnt"] > 0 if rows else False
-        except Exception:
-            return False
+            for raw in config_path.read_text().splitlines():
+                line = raw.split("#", 1)[0].rstrip()
+                if not line or ":" not in line:
+                    continue
+                key, _, value = line.partition(":")
+                if key.strip() == "ollama_model":
+                    return value.strip().strip('"').strip("'") or None
+        except OSError:
+            return None
+        return None
+
+    @staticmethod
+    def _locate_config_yaml():
+        for cand in (
+            Path.home() / "carpenter" / "config" / "config.yaml",
+            Path("/home/pi/carpenter/config/config.yaml"),
+        ):
+            if cand.is_file():
+                return cand
+        return None
+
+    @staticmethod
+    def _fetch_conv_override(db: DBInspector, conv_id: int) -> dict | None:
+        rows = db._query(
+            "SELECT ai_provider, model FROM conversations WHERE id = ?",
+            (conv_id,),
+        )
+        return rows[0] if rows else None
+
+    @staticmethod
+    def _count_tool_calls(db: DBInspector, conv_id: int) -> int:
+        rows = db._query(
+            "SELECT COUNT(*) AS cnt FROM tool_calls WHERE conversation_id = ?",
+            (conv_id,),
+        )
+        return int(rows[0]["cnt"]) if rows else 0
+
+    @staticmethod
+    def _count_tool_calls_by_name(
+        db: DBInspector, conv_id: int, tool_name: str
+    ) -> int:
+        rows = db._query(
+            "SELECT COUNT(*) AS cnt FROM tool_calls "
+            "WHERE conversation_id = ? AND tool_name = ?",
+            (conv_id, tool_name),
+        )
+        return int(rows[0]["cnt"]) if rows else 0
+
+    def cleanup(self, client: CarpenterClient, db: DBInspector) -> None:
+        """Clear the per-conversation pin and archive the test conversation.
+
+        Scoped narrowly by conversation id: does NOT touch any other
+        conversations or use broad pattern deletes.
+        """
+        conv_id = getattr(self, "_conv_id", None)
+        if conv_id is None or db is None:
+            return
+        try:
+            conn = sqlite3.connect(db.db_path)
+            try:
+                conn.execute(
+                    "UPDATE conversations "
+                    "SET ai_provider = NULL, model = NULL, archived = 1 "
+                    "WHERE id = ?",
+                    (conv_id,),
+                )
+                conn.commit()
+                print(f"  [cleanup] Cleared pin on conversation #{conv_id} "
+                      "and archived it.")
+            finally:
+                conn.close()
+        except Exception as exc:
+            print(f"  [cleanup] Cleanup failed for conv #{conv_id}: {exc}")
+
+        if (
+            getattr(self, "_config_snapshot", None) is not None
+            and getattr(self, "_config_path", None) is not None
+        ):
+            try:
+                now_bytes = self._config_path.read_bytes()
+                if now_bytes != self._config_snapshot[1]:
+                    print(
+                        "  [cleanup] WARNING: global config.yaml changed "
+                        "during the story run."
+                    )
+            except Exception:
+                pass

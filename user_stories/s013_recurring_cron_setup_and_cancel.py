@@ -49,7 +49,6 @@ from user_stories.framework import (
     CarpenterClient,
 )
 
-_CRON_NAME_PREFIX = "s013-posture"
 _REMINDER_KEYWORD = "posture"
 
 # How long to wait for 2 recurring messages to arrive (generous for Pi + cron
@@ -58,11 +57,16 @@ _REMINDER_KEYWORD = "posture"
 # LLM processing time for the cron setup).
 _WAIT_FOR_TWO_MESSAGES_SECONDS = 7 * 60  # 7 minutes
 
-_SETUP_PROMPT = (
-    "Every minute, please send me a short message in this conversation to remind "
-    "me to check my posture. Use the scheduling tools to set up a recurring "
-    "trigger that fires every minute. Keep doing it until I tell you to stop."
-)
+def _setup_prompt(cron_name: str) -> str:
+    return (
+        "Every minute, please send me a short message in this conversation to "
+        "remind me to check my posture. Use the scheduling tools to set up a "
+        "recurring trigger that fires every minute. Keep doing it until I tell "
+        "you to stop. "
+        f"Please name the cron/schedule entry `{cron_name}` so it's easy to "
+        "identify as a test artifact."
+    )
+
 
 _CANCEL_PROMPT = "Please stop sending those repeating reminders."
 
@@ -74,14 +78,16 @@ class RecurringCronSetupAndCancel(AcceptanceStory):
         "agent creates a recurring schedule; two messages arrive; user cancels; "
         "agent confirms; DB has no leftover cron entry."
     )
+    artifact_prefix = "s013"
 
     def run(self, client: CarpenterClient, db: DBInspector) -> StoryResult:
         start_ts = time.time()
 
         # ── 1. Request recurring reminders ────────────────────────────────────
         print("\n  [1/4] Requesting per-minute posture reminders...")
+        cron_name = self.artifact_name("posture")
         conv_id = client.create_conversation()
-        client.send_message(_SETUP_PROMPT, conv_id)
+        client.send_message(_setup_prompt(cron_name), conv_id)
         client.wait_for_pending_to_clear(conv_id, timeout=90)
 
         setup_msgs = client.get_assistant_messages(conv_id)
@@ -196,7 +202,7 @@ class RecurringCronSetupAndCancel(AcceptanceStory):
         # No enabled cron entry for this recurring reminder should remain.
         leftover_crons = db._query(
             "SELECT * FROM cron_entries WHERE name LIKE ? AND enabled = 1",
-            (f"{_CRON_NAME_PREFIX}%",),
+            (self.artifact_name_pattern(),),
         )
         self.assert_that(
             len(leftover_crons) == 0,
@@ -220,20 +226,21 @@ class RecurringCronSetupAndCancel(AcceptanceStory):
         )
 
     def cleanup(self, client: CarpenterClient, db: DBInspector) -> None:
-        """Remove any cron entries created by this story so it doesn't accumulate."""
+        """Remove any cron entries created by this run so it doesn't accumulate."""
         if db is None:
             return
         import sqlite3
+        pattern = self.artifact_name_pattern()
         try:
             conn = sqlite3.connect(db.db_path)
             try:
                 cur = conn.execute(
                     "DELETE FROM cron_entries WHERE name LIKE ?",
-                    (f"{_CRON_NAME_PREFIX}%",),
+                    (pattern,),
                 )
                 if cur.rowcount:
                     print(f"  [cleanup] Removed {cur.rowcount} cron entry/entries "
-                          f"matching '{_CRON_NAME_PREFIX}%'")
+                          f"matching '{pattern}'")
                 conn.commit()
             finally:
                 conn.close()

@@ -1,35 +1,53 @@
 """
-S049 — Daily Reflection Template End-to-End
+S049 — Reflection Template End-to-End (Per-Arc Trigger)
 
-Triggers a daily reflection via direct work-queue injection and verifies the
-full template-based flow: parent arc creation → child arcs (reflect +
-save-reflection) → AI invocation → reflection persisted to DB.
+Verifies the full per-arc reflection flow: completing a root arc triggers
+the reflection subscription, which creates a reflection arc with the correct
+4-step template structure, runs AI analysis, and persists the result to KB.
 
-Pre-requisite: reflection.enabled must be True in config.yaml and the server
-must be running with the reflection handler registered.
+Background: reflections are no longer cadence-based (daily/weekly/monthly).
+Since PR #250, a reflection fires automatically when any non-reflection root
+arc reaches "completed" status, via an arc.status_changed subscription.
+
+Per D2 PR-α (carpenter-core PR #298), template arcs now carry a
+``step_role`` column populated from the template YAML. This story asserts
+on the role-based identity ``(template_name, step_role)`` rather than on
+the human-readable ``arc.name``, treating the latter as presentation only.
+
+Trigger mechanism:
+  1. Insert a synthetic root arc (status=completed) into the arcs table.
+  2. Emit an arc.status_changed event with is_root=True, new_status=completed.
+  3. The server's event processor picks it up and invokes the reflection
+     subscription, creating a reflection arc from the template.
 
 Expected behaviour:
-  1. A "reflection.trigger" work item is enqueued with cadence=daily.
-  2. The handler creates a parent arc named "daily-reflection" (PLANNER).
-  3. The reflection template is instantiated as two children:
-     - "reflect" (EXECUTOR, runs AI analysis)
-     - "save-reflection" (Python-only, persists output)
-  4. The reflect arc is dispatched and produces analysis text.
-  5. The save-reflection step saves the output to the reflections table.
-  6. All arcs reach a terminal state.
+  1. A reflection parent arc is created (template_name="reflection",
+     priority=1000 / idle).
+  2. The reflection template instantiates 4 child arcs in order, asserted
+     by their ``step_role``:
+     - role=prepare  (order=0; was "gather-activity")
+     - role=analyze  (order=1; was "reflect"; EXECUTOR, runs AI)
+     - role=persist  (order=2; was "save-reflection")
+     - role=dispatch (order=3; was "dispatch-actions")
+  3. The analyze arc produces AI analysis text.
+  4. The persist step writes a KB entry at reflections/by-arc/{arc_id}.
+  5. All arcs reach a terminal state.
 
-DB verification:
-  - Parent arc exists with name "daily-reflection", agent_type PLANNER.
-  - Two child arcs with correct names and ordering.
-  - arc_state on parent contains cadence, period_start, period_end.
-  - reflections table has a new row with cadence="daily" and non-empty content.
+DB/KB verification:
+  - Parent arc has template_name="reflection" (joined through
+    workflow_templates), priority=1000.
+  - Four child arcs with the expected step_roles and ordering.
+  - arc_state on reflection arc contains "reflected_arc_id".
+  - KB entry exists at path "reflections/by-arc/{synthetic_arc_id}".
+  - KB entry content is non-trivial (> 50 chars).
 
-Cleanup: removes arcs, reflections, and conversations created during the test.
+Cleanup: removes the synthetic arc, its reflection arc family, and KB entry.
 """
 
 import json
 import sqlite3
 import time
+from datetime import datetime, timezone
 
 from user_stories.framework import (
     AcceptanceStory,
@@ -38,21 +56,26 @@ from user_stories.framework import (
     CarpenterClient,
 )
 
+# Expected step roles in the reflection template (must match reflection.yaml).
+# Per D2 PR-α: identity for the dispatch path is (template_name, step_role).
+# Names are kept as presentation; assertions key on roles.
+EXPECTED_ROLES = ["prepare", "analyze", "persist", "dispatch"]
 
-def _inject_work_item(db_path: str, cadence: str = "daily") -> int:
-    """Insert a reflection.trigger work item directly into the work queue.
 
-    Returns the work item ID.
+def _insert_synthetic_root_arc(db_path: str, name: str = "test-goal") -> int:
+    """Insert a completed root arc and return its ID.
+
+    The arc is marked completed directly so we can emit the event immediately.
+    We do NOT go through arc_history or notify the server's internal arc
+    manager — we just need a real arc row to reference.
     """
     conn = sqlite3.connect(db_path)
     try:
-        payload = json.dumps({"event_payload": {"cadence": cadence}})
-        idem_key = f"test-reflection-{cadence}-{int(time.time())}"
         cur = conn.execute(
-            "INSERT INTO work_queue "
-            "(event_type, payload_json, status, max_retries, idempotency_key) "
-            "VALUES (?, ?, 'pending', 1, ?)",
-            ("reflection.trigger", payload, idem_key),
+            "INSERT INTO arcs "
+            "(name, goal, status, priority, integrity_level, agent_type) "
+            "VALUES (?, ?, 'completed', 100, 'trusted', 'EXECUTOR')",
+            (name, f"Synthetic test arc for s049 acceptance story ({int(time.time())})"),
         )
         conn.commit()
         return cur.lastrowid
@@ -60,145 +83,184 @@ def _inject_work_item(db_path: str, cadence: str = "daily") -> int:
         conn.close()
 
 
-class DailyReflectionTemplate(AcceptanceStory):
-    name = "S049 — Daily Reflection Template End-to-End"
+def _emit_arc_status_changed(db_path: str, arc_id: int) -> None:
+    """Emit an arc.status_changed event that triggers the reflection subscription.
+
+    Mirrors what carpenter.core.engine.triggers.arc_lifecycle.emit_status_changed()
+    does: inserts a row into the events table with the required payload shape.
+    The server's event processor will pick it up and invoke any matching
+    subscriptions (including the reflection one).
+    """
+    payload = json.dumps({
+        "arc_id": arc_id,
+        "old_status": "active",
+        "new_status": "completed",
+        "is_root": True,
+        # No template_name — simulates a plain user-goal arc.
+        # The reflection subscription filter requires template_name != 'reflection',
+        # and $ne matches when the key is absent.
+    })
+    idempotency_key = f"arc-{arc_id}-active-completed"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO events "
+            "(event_type, payload_json, source, processed, priority, idempotency_key) "
+            "VALUES ('arc.status_changed', ?, ?, 0, 0, ?)",
+            (payload, f"arc:{arc_id}", idempotency_key),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class ReflectionTemplateEndToEnd(AcceptanceStory):
+    name = "S049 — Reflection Template End-to-End"
     description = (
-        "Trigger a daily reflection via work-queue injection; verify arc tree "
-        "structure, AI execution, and DB persistence of the reflection output."
+        "Complete a root arc; verify per-arc reflection flow: parent arc, "
+        "4 template steps (gather-activity/reflect/save-reflection/dispatch-actions), "
+        "AI execution, and KB persistence."
     )
     timeout = 300  # AI model call can take time
 
     # Track IDs for cleanup
-    _parent_arc_id: int | None = None
-    _reflection_id: int | None = None
-    _work_item_id: int | None = None
+    _synthetic_arc_id: int | None = None
+    _reflection_arc_id: int | None = None
 
     def run(self, client: CarpenterClient, db: DBInspector) -> StoryResult:
         self.assert_that(db is not None, "DB inspector required for this test")
         start_ts = time.time()
 
-        # ── 0. Pre-check: reflection handler must be registered ────────────
-        # If the handler is not registered, work items will sit unprocessed.
-        # We detect this by checking server logs or config.
-        print("\n  [0/5] Pre-check: verifying reflection handler is registered...")
+        # ── 1. Create synthetic root arc + emit event ───────────────────────
+        print("\n  [1/5] Inserting synthetic completed root arc + emitting event...")
+        self._synthetic_arc_id = _insert_synthetic_root_arc(db.db_path)
+        print(f"     Synthetic arc ID: {self._synthetic_arc_id}")
+        _emit_arc_status_changed(db.db_path, self._synthetic_arc_id)
+        print(f"     arc.status_changed event emitted for arc {self._synthetic_arc_id}")
 
-        # Quick check: see if there's a registered handler by looking at
-        # recent work queue items with event_type=reflection.trigger.
-        # If none exist, we'll be the first — that's fine.
-
-        # ── 1. Inject work item ────────────────────────────────────────────
-        print("  [1/5] Injecting reflection.trigger work item...")
-        self._work_item_id = _inject_work_item(db.db_path, "daily")
-        print(f"     Work item ID: {self._work_item_id}")
-
-        # ── 2. Wait for parent arc and children to appear ──────────────────
-        print("  [2/5] Waiting for parent arc 'daily-reflection' + 2 children (up to 30s)...")
-        parent_arc = None
+        # ── 2. Wait for reflection arc + 4 children to appear ───────────────
+        print("  [2/5] Waiting for reflection arc (template_name='reflection') "
+              "+ 4 children (up to 30s)...")
+        reflection_arc = None
         children = []
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             new_arcs = db.get_arcs_created_after(start_ts)
-            candidates = [
-                a for a in new_arcs
-                if a.get("name") == "daily-reflection"
-            ]
+            # Identify the spawned arc by its template_name (D2 PR-α
+            # identity), not by arc.name. Skip the synthetic root arc
+            # we injected as the trigger source.
+            candidates = []
+            for a in new_arcs:
+                if a["id"] == self._synthetic_arc_id:
+                    continue
+                if a.get("parent_id") is not None:
+                    continue
+                if db.get_arc_template_name(a["id"]) == "reflection":
+                    candidates.append(a)
             if candidates:
-                parent_arc = candidates[0]
-                self._parent_arc_id = parent_arc["id"]
-                children = db.get_arc_children(self._parent_arc_id)
-                if len(children) >= 2:
+                reflection_arc = candidates[0]
+                self._reflection_arc_id = reflection_arc["id"]
+                children = db.get_arc_children(self._reflection_arc_id)
+                if len(children) >= 4:
                     break
             time.sleep(1)
 
         self.assert_that(
-            parent_arc is not None,
-            "Parent arc 'daily-reflection' was not created within 30s. "
-            "Is reflection.enabled=true in config and server restarted?",
+            reflection_arc is not None,
+            "Reflection arc was not created within 30s after emitting "
+            "arc.status_changed. Is the server running and subscription loaded?",
         )
-        self._parent_arc_id = parent_arc["id"]
-        print(f"     Parent arc ID: {self._parent_arc_id}")
+        self._reflection_arc_id = reflection_arc["id"]
+        print(f"     Reflection arc ID: {self._reflection_arc_id}")
 
-        # ── 3. Verify arc tree structure ───────────────────────────────────
+        # ── 3. Verify arc tree structure ─────────────────────────────────────
         print("  [3/5] Verifying arc tree structure...")
 
-        # Parent should be PLANNER
-        # Refresh parent to get latest state
-        parent_arc = db.get_arc(self._parent_arc_id)
+        # Refresh reflection arc
+        reflection_arc = db.get_arc(self._reflection_arc_id)
         self.assert_that(
-            parent_arc is not None and parent_arc.get("agent_type") == "PLANNER",
-            f"Parent arc agent_type should be PLANNER, got {parent_arc.get('agent_type') if parent_arc else 'None'}",
+            reflection_arc is not None,
+            "Could not re-fetch reflection arc",
         )
 
-        # Children already fetched in the wait loop
+        # Re-confirm template_name on the parent for the role-based identity.
+        parent_template_name = db.get_arc_template_name(self._reflection_arc_id)
+        self.assert_that(
+            parent_template_name == "reflection",
+            f"Parent arc template_name should be 'reflection', got "
+            f"{parent_template_name!r}",
+        )
+
+        # Priority should be 1000 (idle — reflections run at background priority)
+        self.assert_that(
+            reflection_arc.get("priority") == 1000,
+            f"Reflection arc priority should be 1000 (idle), got "
+            f"{reflection_arc.get('priority')}",
+        )
+
+        child_roles = [c.get("step_role") for c in children]
         child_names = [c["name"] for c in children]
-        print(f"     Children: {child_names}")
+        print(f"     Children ({len(children)}): roles={child_roles} names={child_names}")
 
         self.assert_that(
-            len(children) == 2,
-            f"Expected 2 child arcs, got {len(children)}: {child_names}",
+            len(children) == 4,
+            f"Expected 4 child arcs, got {len(children)}: roles={child_roles}",
             arcs=db.format_arcs_table(children),
         )
 
+        # Assert presence + ordering by step_role (D2 PR-α identity).
+        role_map: dict[str, dict] = {}
+        for role in EXPECTED_ROLES:
+            arc = db.get_arc_by_role(self._reflection_arc_id, role)
+            self.assert_that(
+                arc is not None,
+                f"Missing child arc with step_role={role!r}. "
+                f"Got roles={child_roles}, names={child_names}",
+                arcs=db.format_arcs_table(children),
+            )
+            role_map[role] = arc
+
+        for i, role in enumerate(EXPECTED_ROLES):
+            arc = role_map[role]
+            self.assert_that(
+                arc.get("step_order") == i,
+                f"step_role={role!r} should have step_order={i}, got "
+                f"{arc.get('step_order')}",
+            )
+
+        # The analyze step is the only LLM-driven one (EXECUTOR).
+        analyze_arc = role_map["analyze"]
         self.assert_that(
-            "reflect" in child_names,
-            f"Missing 'reflect' child arc. Got: {child_names}",
-        )
-        self.assert_that(
-            "save-reflection" in child_names,
-            f"Missing 'save-reflection' child arc. Got: {child_names}",
+            analyze_arc.get("agent_type") == "EXECUTOR",
+            f"analyze arc should be EXECUTOR, got "
+            f"{analyze_arc.get('agent_type')}",
         )
 
-        # Check ordering: reflect should come before save-reflection
-        reflect_arc = next(c for c in children if c["name"] == "reflect")
-        save_arc = next(c for c in children if c["name"] == "save-reflection")
-
+        # Verify reflected_arc_id in arc_state points back to our synthetic arc
+        refl_state = db.get_arc_state(self._reflection_arc_id)
+        print(f"     Reflection arc_state keys: {list(refl_state.keys())}")
         self.assert_that(
-            (reflect_arc.get("step_order") or 0) < (save_arc.get("step_order") or 0),
-            "reflect arc should have lower step_order than save-reflection",
-        )
-
-        # Verify reflect arc is EXECUTOR
-        self.assert_that(
-            reflect_arc.get("agent_type") == "EXECUTOR",
-            f"reflect arc should be EXECUTOR, got {reflect_arc.get('agent_type')}",
-        )
-
-        # Check parent arc_state metadata
-        parent_state = db.get_arc_state(self._parent_arc_id)
-        print(f"     Parent arc_state keys: {list(parent_state.keys())}")
-
-        self.assert_that(
-            parent_state.get("cadence") == "daily",
-            f"arc_state cadence should be 'daily', got {parent_state.get('cadence')}",
+            "reflected_arc_id" in refl_state,
+            f"arc_state missing 'reflected_arc_id'. Keys: {list(refl_state.keys())}",
         )
         self.assert_that(
-            "period_start" in parent_state,
-            "arc_state missing 'period_start'",
+            refl_state["reflected_arc_id"] == self._synthetic_arc_id,
+            f"reflected_arc_id should be {self._synthetic_arc_id}, "
+            f"got {refl_state['reflected_arc_id']}",
         )
-        self.assert_that(
-            "period_end" in parent_state,
-            "arc_state missing 'period_end'",
-        )
-
         print("     Arc tree structure verified ✓")
 
-        # ── 4. Wait for all arcs to complete ───────────────────────────────
-        print("  [4/5] Waiting for arcs to complete (up to 240s)...")
+        # ── 4. Wait for all arcs to complete ────────────────────────────────
+        print("  [4/5] Waiting for reflection arcs to complete (up to 240s)...")
         arc_deadline = time.monotonic() + 240
         last_print = 0
 
         while time.monotonic() < arc_deadline:
-            all_arcs = [parent_arc] + db.get_arc_children(self._parent_arc_id)
-            # Refresh parent
-            refreshed_parent = db.get_arc(self._parent_arc_id)
-            if refreshed_parent:
-                all_arcs[0] = refreshed_parent
-
+            all_arcs = [db.get_arc(self._reflection_arc_id)] + \
+                       db.get_arc_children(self._reflection_arc_id)
             pending = [
-                a for a in all_arcs
-                if a.get("status") not in (
-                    "completed", "failed", "cancelled", "frozen"
-                )
+                a for a in all_arcs if a is not None and
+                a.get("status") not in ("completed", "failed", "cancelled", "frozen")
             ]
             if not pending:
                 break
@@ -212,21 +274,19 @@ class DailyReflectionTemplate(AcceptanceStory):
                 last_print = now
             time.sleep(2)
         else:
-            # Timeout — check what happened
-            all_arcs = [db.get_arc(self._parent_arc_id)] + db.get_arc_children(
-                self._parent_arc_id
-            )
+            all_arcs = [db.get_arc(self._reflection_arc_id)] + \
+                       db.get_arc_children(self._reflection_arc_id)
             statuses = ", ".join(
                 f"{a['name']}={a.get('status')}" for a in all_arcs if a
             )
             self.assert_that(
                 False,
-                f"Arcs did not complete within 240s. Statuses: {statuses}",
-                arcs=db.format_arcs_table(all_arcs),
+                f"Reflection arcs did not complete within 240s. Statuses: {statuses}",
+                arcs=db.format_arcs_table([a for a in all_arcs if a]),
             )
 
         # Check for failures
-        final_children = db.get_arc_children(self._parent_arc_id)
+        final_children = db.get_arc_children(self._reflection_arc_id)
         failed = [c for c in final_children if c.get("status") == "failed"]
         if failed:
             for f in failed:
@@ -239,81 +299,54 @@ class DailyReflectionTemplate(AcceptanceStory):
             + ", ".join(f"{f['name']} (id={f['id']})" for f in failed),
             arcs=db.format_arcs_table(final_children),
         )
+        print("     All reflection arcs completed ✓")
 
-        print("     All arcs completed ✓")
+        # ── 5. Verify KB entry ───────────────────────────────────────────────
+        print("  [5/5] Verifying KB entry...")
 
-        # ── 5. Verify reflection in DB ─────────────────────────────────────
-        print("  [5/5] Verifying reflection in database...")
-
-        # Find reflections created after start_ts
-        from datetime import datetime, timezone
-        since_iso = datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-        reflections = db.fetchall(
-            "SELECT * FROM reflections WHERE cadence = 'daily' "
-            "AND created_at >= ? ORDER BY id DESC LIMIT 1",
-            (since_iso,),
-        )
+        expected_kb_path = f"reflections/by-arc/{self._synthetic_arc_id}"
+        kb_entries = db.get_kb_entries(path_prefix="reflections/by-arc/")
+        matching = [e for e in kb_entries if e["path"] == expected_kb_path]
 
         self.assert_that(
-            len(reflections) >= 1,
-            "No daily reflection found in reflections table after test start",
+            len(matching) >= 1,
+            f"No KB entry at '{expected_kb_path}'. "
+            f"Available by-arc entries: "
+            f"{[e['path'] for e in kb_entries]}",
         )
 
-        reflection = reflections[0]
-        self._reflection_id = reflection["id"]
-        content = reflection.get("content", "")
-
-        print(f"     Reflection ID: {self._reflection_id}")
-        print(f"     Content length: {len(content)} chars")
-        print(f"     Content preview: {content[:200]}...")
-
+        # Verify content is substantive (save-reflection ran AI output)
+        # KB stores content on disk; check byte_count as proxy
+        kb_entry = matching[0]
+        print(f"     KB entry: {kb_entry['path']} ({kb_entry.get('byte_count', 0)} bytes)")
         self.assert_that(
-            len(content) > 50,
-            f"Reflection content too short ({len(content)} chars), "
-            "expected substantive analysis",
-            content_preview=content[:500],
-        )
-
-        # Verify the content mentions some expected activity-related terms
-        content_lower = content.lower()
-        activity_terms = [
-            "conversation", "arc", "tool", "token", "activity",
-            "pattern", "knowledge", "period", "summary",
-        ]
-        matches = [t for t in activity_terms if t in content_lower]
-        self.assert_that(
-            len(matches) >= 2,
-            f"Reflection content should mention activity metrics. "
-            f"Found: {matches}. Expected ≥2 of {activity_terms}",
-            content_preview=content[:500],
-        )
-
-        # Verify period fields are set
-        self.assert_that(
-            reflection.get("period_start") is not None,
-            "Reflection missing period_start",
+            kb_entry.get("byte_count", 0) > 50,
+            f"KB entry byte_count too small ({kb_entry.get('byte_count', 0)}); "
+            "expected substantive reflection content",
         )
         self.assert_that(
-            reflection.get("period_end") is not None,
-            "Reflection missing period_end",
+            kb_entry.get("entry_type") == "reflection",
+            f"KB entry_type should be 'reflection', got '{kb_entry.get('entry_type')}'",
         )
+
+        print(f"     KB entry '{expected_kb_path}' verified ✓")
 
         return StoryResult(
             name=self.name,
             passed=True,
             message=(
-                f"Parent arc created ✓, "
-                f"2 children (reflect+save-reflection) ✓, "
+                f"Reflection arc created (id={self._reflection_arc_id}, "
+                f"template_name='reflection', priority=1000) ✓, "
+                f"4 template steps verified by step_role "
+                f"({', '.join(EXPECTED_ROLES)}) ✓, "
+                f"reflected_arc_id={self._synthetic_arc_id} ✓, "
                 f"arcs completed ✓, "
-                f"reflection saved (id={self._reflection_id}, "
-                f"{len(content)} chars) ✓"
+                f"KB entry at {expected_kb_path} ✓"
             ),
         )
 
     def cleanup(self, client: CarpenterClient, db: "DBInspector | None") -> None:
-        """Remove arcs, reflections, and conversations created during test."""
+        """Remove synthetic arc, reflection arc family, and KB entry."""
         if db is None:
             return
 
@@ -321,75 +354,68 @@ class DailyReflectionTemplate(AcceptanceStory):
         try:
             deleted = []
 
-            # Delete reflection
-            if self._reflection_id:
-                conn.execute(
-                    "DELETE FROM reflections WHERE id = ?",
-                    (self._reflection_id,),
-                )
-                deleted.append(f"reflection {self._reflection_id}")
-
-            # Delete child arcs and parent arc
-            if self._parent_arc_id:
-                # Get conversation linked to parent
-                conv_row = conn.execute(
-                    "SELECT conversation_id FROM conversation_arcs "
-                    "WHERE arc_id = ?",
-                    (self._parent_arc_id,),
-                ).fetchone()
-
-                # Delete children first
+            if self._reflection_arc_id:
+                # Remove grandchildren (dispatch-actions may spawn child arcs)
                 child_ids = [
                     r[0] for r in conn.execute(
                         "SELECT id FROM arcs WHERE parent_id = ?",
-                        (self._parent_arc_id,),
+                        (self._reflection_arc_id,),
                     ).fetchall()
                 ]
                 for cid in child_ids:
+                    grandchild_ids = [
+                        r[0] for r in conn.execute(
+                            "SELECT id FROM arcs WHERE parent_id = ?", (cid,)
+                        ).fetchall()
+                    ]
+                    for gcid in grandchild_ids:
+                        conn.execute("DELETE FROM arc_state WHERE arc_id = ?", (gcid,))
+                        conn.execute("DELETE FROM arc_history WHERE arc_id = ?", (gcid,))
+                        conn.execute("DELETE FROM arcs WHERE id = ?", (gcid,))
                     conn.execute("DELETE FROM arc_state WHERE arc_id = ?", (cid,))
                     conn.execute("DELETE FROM arc_history WHERE arc_id = ?", (cid,))
                     conn.execute("DELETE FROM arcs WHERE id = ?", (cid,))
-                deleted.append(f"{len(child_ids)} child arcs")
+                deleted.append(f"{len(child_ids)} reflection child arcs")
 
-                # Delete parent arc
+                # Remove reflection parent arc
                 conn.execute(
                     "DELETE FROM arc_state WHERE arc_id = ?",
-                    (self._parent_arc_id,),
+                    (self._reflection_arc_id,),
                 )
                 conn.execute(
                     "DELETE FROM arc_history WHERE arc_id = ?",
-                    (self._parent_arc_id,),
-                )
-                conn.execute(
-                    "DELETE FROM conversation_arcs WHERE arc_id = ?",
-                    (self._parent_arc_id,),
+                    (self._reflection_arc_id,),
                 )
                 conn.execute(
                     "DELETE FROM arcs WHERE id = ?",
-                    (self._parent_arc_id,),
+                    (self._reflection_arc_id,),
                 )
-                deleted.append(f"parent arc {self._parent_arc_id}")
+                deleted.append(f"reflection arc {self._reflection_arc_id}")
 
-                # Delete linked conversation
-                if conv_row:
-                    conv_id = conv_row[0]
-                    conn.execute(
-                        "DELETE FROM messages WHERE conversation_id = ?",
-                        (conv_id,),
-                    )
-                    conn.execute(
-                        "DELETE FROM conversations WHERE id = ?",
-                        (conv_id,),
-                    )
-                    deleted.append(f"conversation {conv_id}")
-
-            # Delete work item
-            if self._work_item_id:
+                # Remove KB entry
+                expected_kb_path = f"reflections/by-arc/{self._synthetic_arc_id}"
                 conn.execute(
-                    "DELETE FROM work_queue WHERE id = ?",
-                    (self._work_item_id,),
+                    "DELETE FROM kb_entries WHERE path = ?",
+                    (expected_kb_path,),
                 )
-                deleted.append(f"work item {self._work_item_id}")
+                deleted.append(f"KB entry {expected_kb_path}")
+
+            if self._synthetic_arc_id:
+                conn.execute(
+                    "DELETE FROM arc_state WHERE arc_id = ?",
+                    (self._synthetic_arc_id,),
+                )
+                conn.execute(
+                    "DELETE FROM arcs WHERE id = ?",
+                    (self._synthetic_arc_id,),
+                )
+                # Clean up the event we emitted
+                conn.execute(
+                    "DELETE FROM events WHERE source = ? "
+                    "AND event_type = 'arc.status_changed'",
+                    (f"arc:{self._synthetic_arc_id}",),
+                )
+                deleted.append(f"synthetic arc {self._synthetic_arc_id}")
 
             conn.commit()
             if deleted:

@@ -12,8 +12,10 @@ Provides the building blocks for writing acceptance stories:
 import json
 import sqlite3
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -40,9 +42,13 @@ class StoryResult:
     error: str = ""
     diagnostics: dict = field(default_factory=dict)
     duration_s: float = 0.0
+    skipped: bool = False
 
     def __str__(self) -> str:
-        status = "PASS" if self.passed else "FAIL"
+        if self.skipped:
+            status = "SKIP"
+        else:
+            status = "PASS" if self.passed else "FAIL"
         return f"[{status}] {self.name} ({self.duration_s:.1f}s)"
 
 
@@ -52,7 +58,38 @@ class StoryResult:
 
 
 class CarpenterClient:
-    """HTTP client for interacting with Carpenter's chat API."""
+    """HTTP client for interacting with Carpenter's chat API.
+
+    Transient-error retry policy
+    ----------------------------
+    Both ``_get`` and ``_post`` retry on:
+    - ``httpx.ReadTimeout`` / ``httpx.ConnectError`` /
+      ``httpx.RemoteProtocolError`` / ``httpx.ConnectTimeout`` /
+      ``httpx.ReadError``  (network glitches, server restart mid-call,
+      connection reset)
+    - HTTP 5xx responses                 (server-side hiccup)
+    - HTTP 408 / 429                     (transient)
+    - HTTP 400 — retried at most once. Most 400s are real client errors,
+      but the carpenter server has produced occasional transient 400s
+      (likely race conditions in chat init). One retry costs <1s and
+      catches the transient case without papering over real bugs.
+
+    Up to 4 attempts total with exponential backoff (0.5s, 1s, 2s) plus
+    small jitter. Only persistent failures (= actual outage, not glitch)
+    surface to callers.
+    """
+
+    # Status codes we treat as transient and retry up to MAX_ATTEMPTS.
+    _TRANSIENT_STATUS_CODES = (408, 429, 500, 502, 503, 504)
+    _RETRYABLE_EXCEPTIONS = (
+        httpx.ReadTimeout,
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.RemoteProtocolError,
+        httpx.ReadError,
+    )
+    _MAX_ATTEMPTS = 4
+    _BASE_BACKOFF_S = 0.5
 
     def __init__(self, base_url: str, token: str | None = None, timeout: int = 60):
         self.base_url = base_url.rstrip("/")
@@ -62,19 +99,81 @@ class CarpenterClient:
         if token:
             self._headers["Authorization"] = f"Bearer {token}"
 
-    def _get(self, path: str, **kw) -> httpx.Response:
+    def _backoff_sleep(self, attempt: int) -> None:
+        import random
+        delay = self._BASE_BACKOFF_S * (2 ** attempt) + random.uniform(0, 0.2)
+        time.sleep(delay)
+
+    def _request_with_retries(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict | None = None,
+        **kw,
+    ) -> httpx.Response:
+        """Issue an HTTP request with transient-failure retries.
+
+        Returns the final ``httpx.Response`` (which may carry a non-2xx
+        status if the caller is willing to handle it — we do NOT raise
+        on non-2xx; we only retry transient ones).  Raises the last
+        exception only if every attempt raised a retryable network
+        exception.
+        """
+        url = f"{self.base_url}{path}"
         kw.setdefault("timeout", self._default_timeout)
-        kw.setdefault("follow_redirects", False)
-        # Retry once on ReadTimeout — the Pi server can be slow under load
-        try:
-            return httpx.get(f"{self.base_url}{path}", headers=self._headers, **kw)
-        except httpx.ReadTimeout:
-            return httpx.get(f"{self.base_url}{path}", headers=self._headers, **kw)
+        if method == "GET":
+            kw.setdefault("follow_redirects", False)
+
+        last_exc: Exception | None = None
+        last_response: httpx.Response | None = None
+        # Allow at most one retry for HTTP 400.
+        retried_400 = False
+        for attempt in range(self._MAX_ATTEMPTS):
+            try:
+                if method == "GET":
+                    response = httpx.get(url, headers=self._headers, **kw)
+                else:
+                    response = httpx.post(
+                        url, json=json_body, headers=self._headers, **kw,
+                    )
+            except self._RETRYABLE_EXCEPTIONS as exc:
+                last_exc = exc
+                if attempt < self._MAX_ATTEMPTS - 1:
+                    self._backoff_sleep(attempt)
+                    continue
+                raise
+
+            last_response = response
+            sc = response.status_code
+
+            if sc in self._TRANSIENT_STATUS_CODES:
+                if attempt < self._MAX_ATTEMPTS - 1:
+                    self._backoff_sleep(attempt)
+                    continue
+                return response  # exhausted retries; let caller decide
+
+            if sc == 400 and not retried_400:
+                retried_400 = True
+                if attempt < self._MAX_ATTEMPTS - 1:
+                    self._backoff_sleep(attempt)
+                    continue
+                return response
+
+            return response
+
+        # Unreachable in practice — loop always returns or raises.
+        if last_response is not None:
+            return last_response
+        assert last_exc is not None
+        raise last_exc
+
+    def _get(self, path: str, **kw) -> httpx.Response:
+        return self._request_with_retries("GET", path, **kw)
 
     def _post(self, path: str, json_body: dict, **kw) -> httpx.Response:
-        kw.setdefault("timeout", self._default_timeout)
-        return httpx.post(
-            f"{self.base_url}{path}", json=json_body, headers=self._headers, **kw
+        return self._request_with_retries(
+            "POST", path, json_body=json_body, **kw,
         )
 
     def is_running(self) -> bool:
@@ -269,6 +368,34 @@ class DBInspector:
             (parent_id,),
         )
 
+    def get_arc_by_role(
+        self, parent_id: int, step_role: str
+    ) -> dict | None:
+        """Return the child arc under ``parent_id`` whose ``step_role`` matches.
+
+        Hides the join through ``workflow_templates`` for stories built around
+        the D2 (template_name, step_role) identity. Falls back to step ``name``
+        for arcs that predate the ``step_role`` column or whose template did
+        not declare a role for that step. Returns the first match by
+        ``step_order`` (roles are not strictly unique within a template).
+        """
+        rows = self._query(
+            "SELECT * FROM arcs "
+            "WHERE parent_id = ? AND step_role = ? "
+            "ORDER BY step_order LIMIT 1",
+            (parent_id, step_role),
+        )
+        if rows:
+            return rows[0]
+        # Fallback for arcs predating the step_role column.
+        rows = self._query(
+            "SELECT * FROM arcs "
+            "WHERE parent_id = ? AND name = ? "
+            "ORDER BY step_order LIMIT 1",
+            (parent_id, step_role),
+        )
+        return rows[0] if rows else None
+
     def get_arc_state(self, arc_id: int) -> dict[str, Any]:
         rows = self._query(
             "SELECT key, value_json FROM arc_state WHERE arc_id = ?", (arc_id,)
@@ -346,6 +473,17 @@ class DBInspector:
             )
         return self._query("SELECT * FROM kb_entries ORDER BY path")
 
+    def get_arc_template_name(self, arc_id: int) -> str | None:
+        """Return the workflow_templates.name for an arc's template, or None."""
+        rows = self._query(
+            "SELECT t.name AS template_name "
+            "FROM arcs a "
+            "JOIN workflow_templates t ON t.id = a.template_id "
+            "WHERE a.id = ?",
+            (arc_id,),
+        )
+        return rows[0]["template_name"] if rows else None
+
     # --- Generic query ---
 
     def fetchall(self, sql: str, params: tuple = ()) -> list[dict]:
@@ -411,11 +549,87 @@ class AcceptanceStory:
     Assertion helpers:
     - `self.assert_that(condition, message)` — generic boolean assert
     - `self.assert_contains(text, substring)` — case-insensitive substring check
+
+    Per-run artifact naming
+    -----------------------
+    Every AcceptanceStory instance gets a fresh short UUID (``self.run_id``,
+    8 hex chars) the first time it is used.  Combined with a subclass's
+    ``artifact_prefix`` (e.g. ``"s053"``), this gives a namespace that is
+    guaranteed unique even across concurrent runs of the same story:
+
+        name = self.artifact_name("morning-briefing")
+        #     -> "s053-ab12cd34-morning-briefing"
+
+    Use ``self.artifact_name(base)`` for any persistent artifact the story
+    creates (cron names, arc names, KB paths, file basenames, etc.) and
+    have cleanup filter with::
+
+        WHERE name LIKE f"{self.artifact_prefix}-{self.run_id}-%"
+
+    For scratch directories, use ``self.run_workspace()`` — a per-run dir
+    under ``/dev/shm/carpenter-acceptance/`` that can never collide with
+    another run and lives on the ramdisk so pytest temp churn doesn't
+    touch the SD card.
     """
 
     name: str = "unnamed"
     description: str = ""
     timeout: int = 300  # Default timeout in seconds for test execution
+
+    #: Short story identifier used as the first segment of artifact names
+    #: (e.g. ``"s053"``).  Subclasses should override.  Defaults to the
+    #: class name lowercased, which is rarely what you want.
+    artifact_prefix: str = ""
+
+    # ------------------------------------------------------------------
+    # Artifact naming helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def run_id(self) -> str:
+        """Lazy-initialised short per-run UUID (8 hex chars).
+
+        We do NOT use ``__init__`` because several existing subclasses
+        override ``__init__`` without calling ``super().__init__()`` and
+        we don't want this to be a breaking change for them.
+        """
+        rid = self.__dict__.get("_run_id")
+        if rid is None:
+            rid = uuid.uuid4().hex[:8]
+            self.__dict__["_run_id"] = rid
+        return rid
+
+    def artifact_name(self, base: str) -> str:
+        """Return a globally-unique artifact name for this run.
+
+        Format: ``{artifact_prefix}-{run_id}-{base}``.  Falls back to
+        ``{class-name}-{run_id}-{base}`` if ``artifact_prefix`` isn't set.
+        """
+        prefix = self.artifact_prefix or type(self).__name__.lower()
+        return f"{prefix}-{self.run_id}-{base}"
+
+    def artifact_name_pattern(self) -> str:
+        """Return the SQL ``LIKE`` pattern covering every artifact of this run.
+
+        Example: ``"s053-ab12cd34-%"``.  Use in cleanup queries like::
+
+            DELETE FROM cron_entries WHERE name LIKE ?
+            # params: (self.artifact_name_pattern(),)
+        """
+        prefix = self.artifact_prefix or type(self).__name__.lower()
+        return f"{prefix}-{self.run_id}-%"
+
+    def run_workspace(self) -> Path:
+        """Return a per-run scratch directory on the ramdisk.
+
+        Lives under ``/dev/shm/carpenter-acceptance/{prefix}-{run_id}/``
+        so concurrent runs of the same story can't collide and heavy temp
+        I/O doesn't hit the SD card.  Created on first access.
+        """
+        prefix = self.artifact_prefix or type(self).__name__.lower()
+        ws = Path("/dev/shm/carpenter-acceptance") / f"{prefix}-{self.run_id}"
+        ws.mkdir(parents=True, exist_ok=True)
+        return ws
 
     def run(
         self, client: CarpenterClient, db: DBInspector

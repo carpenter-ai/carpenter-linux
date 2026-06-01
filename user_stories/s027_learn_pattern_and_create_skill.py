@@ -57,8 +57,14 @@ _STEP3_PROMPT = (
 _REPLAY_PROMPT = (
     "I need to deploy again. Can you repeat that same deploy workflow "
     "we just did? If you've learned the pattern, you could even create "
-    "a knowledge base entry for it."
+    "a knowledge base entry for it. If you do create a KB entry, please "
+    "place it under the path prefix 's027-' (for example "
+    "'s027-deploy-workflow') so it's easy to identify as a test artifact."
 )
+
+# Cleanup deletes only KB entries whose path starts with this prefix,
+# so we can't wipe sibling-test or user KB rows that happen to mention "deploy".
+_KB_PATH_PREFIX = "s027-"
 
 
 class LearnPatternAndCreateSkill(AcceptanceStory):
@@ -124,9 +130,9 @@ class LearnPatternAndCreateSkill(AcceptanceStory):
         kb_created = False
         if db is not None:
             print("  [4/4] Checking for KB entry creation...")
-            kb_entries = db.get_kb_entries()
-            deploy_entries = [e for e in kb_entries
-                             if "deploy" in e.get("path", "").lower()]
+            # Only look at entries the agent tagged with our prefix, so we don't
+            # conflate user-authored or sibling-run KB rows with a story artifact.
+            deploy_entries = db.get_kb_entries(path_prefix=_KB_PATH_PREFIX)
             if deploy_entries:
                 kb_created = True
                 print(f"     KB entry created: {deploy_entries[0]['path']} ✓")
@@ -144,22 +150,32 @@ class LearnPatternAndCreateSkill(AcceptanceStory):
         )
 
     def cleanup(self, client: CarpenterClient, db: "DBInspector | None") -> None:
-        """Remove any deploy-related KB entries created during the test."""
+        """Remove KB entries this story created (scoped to the s027- prefix).
+
+        Previously this matched any KB entry with 'deploy' in its path, which
+        would also wipe user-authored entries and entries created by sibling
+        test runs. The replay prompt now asks the agent to place any KB entry
+        under the 's027-' prefix, so cleanup can filter on that prefix.
+        """
         if db is None:
-            return
-        kb_entries = db.get_kb_entries()
-        deploy_entries = [e for e in kb_entries
-                         if "deploy" in e.get("path", "").lower()]
-        if not deploy_entries:
             return
         try:
             conn = sqlite3.connect(db.db_path)
             try:
-                for entry in deploy_entries:
-                    conn.execute(
-                        "DELETE FROM kb_entries WHERE path = ?", (entry["path"],)
+                cur = conn.execute(
+                    "DELETE FROM kb_entries WHERE path LIKE ?",
+                    (f"{_KB_PATH_PREFIX}%",),
+                )
+                if cur.rowcount:
+                    print(
+                        f"  [cleanup] Removed {cur.rowcount} KB entry/entries "
+                        f"matching '{_KB_PATH_PREFIX}%'"
                     )
-                    print(f"  [cleanup] Removed KB entry: {entry['path']}")
+                # Also drop any inbound kb_links pointing at the removed paths.
+                conn.execute(
+                    "DELETE FROM kb_links WHERE source_path LIKE ?",
+                    (f"{_KB_PATH_PREFIX}%",),
+                )
                 conn.commit()
             finally:
                 conn.close()

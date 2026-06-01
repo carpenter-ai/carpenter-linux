@@ -25,7 +25,7 @@ BASE_DIR="$HOME/carpenter"
 AI_PROVIDER=""
 AI_KEY_FILE=""
 OLLAMA_URL="http://localhost:11434"
-OLLAMA_MODEL="llama3.1"
+OLLAMA_MODEL=""
 UI_TOKEN=""
 SKIP_TOKEN=false
 NON_INTERACTIVE=false
@@ -35,9 +35,7 @@ SANDBOX_ON_FAILURE=""
 SETUP_PLUGIN=""         # "yes", "no", or "" (ask interactively)
 PLUGIN_NAME=""          # Plugin name (default: "claude-code")
 PLUGIN_COMMAND=""       # Watcher command override (auto-detected by default)
-LOCAL_MODEL=""          # Local model key from catalog (e.g. "qwen2.5-1.5b-q4")
 PORT=7842               # Server listen port
-INFERENCE_PORT=8081     # Local inference server port
 
 # ── Parse CLI arguments ──────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -72,20 +70,16 @@ while [[ $# -gt 0 ]]; do
             PLUGIN_NAME="$2"; shift 2 ;;
         --plugin-command)
             PLUGIN_COMMAND="$2"; shift 2 ;;
-        --local-model)
-            LOCAL_MODEL="$2"; shift 2 ;;
         --port)
             PORT="$2"; shift 2 ;;
-        --inference-port)
-            INFERENCE_PORT="$2"; shift 2 ;;
         -h|--help)
             cat <<USAGE
 Usage: install.sh [OPTIONS]
 
-  --ai-provider PROVIDER   anthropic, ollama, tinfoil, local, or skip
+  --ai-provider PROVIDER   anthropic, ollama, tinfoil, or skip
   --ai-key-file PATH       File containing the API key (ANTHROPIC_API_KEY or TINFOIL_API_KEY)
   --ollama-url URL         Ollama API URL (default: http://localhost:11434)
-  --ollama-model MODEL     Ollama model name (default: llama3.1)
+  --ollama-model MODEL     Ollama model name (no default; required for ollama provider)
   --ui-token TOKEN         Set a UI access token (default: auto-generated)
   --skip-token             Skip token generation (no authentication)
   --base-dir DIR           Override base directory (default: ~/carpenter)
@@ -97,9 +91,7 @@ Usage: install.sh [OPTIONS]
   --no-plugin              Skip plugin setup (skip prompt)
   --plugin-name NAME       Plugin name to register (default: claude-code)
   --plugin-command CMD     Watcher command (default: auto-detected claude path)
-  --local-model MODEL      Local model key (e.g. qwen2.5-1.5b-q4)
   --port PORT              Server listen port (default: 7842)
-  --inference-port PORT    Local inference server port (default: 8081)
   -h, --help               Show this help message
 USAGE
             exit 0
@@ -166,7 +158,7 @@ if [[ -f /.dockerenv ]]; then
     IN_CONTAINER=true
 fi
 
-# Hardware detection for local inference recommendation
+# Hardware detection (for informational display)
 ARCH="$(uname -m)"
 TOTAL_RAM_MB=0
 if [[ -f /proc/meminfo ]]; then
@@ -174,19 +166,12 @@ if [[ -f /proc/meminfo ]]; then
 elif command -v sysctl &>/dev/null; then
     TOTAL_RAM_MB=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 / 1024 ))
 fi
-IS_PI_CLASS=false
-if [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]] && [[ "$TOTAL_RAM_MB" -gt 0 && "$TOTAL_RAM_MB" -lt 16384 ]]; then
-    IS_PI_CLASS=true
-fi
 
 echo "  Root/sudo:         $(if $IS_ROOT; then echo 'root'; elif $CAN_SUDO_NOPASS; then echo 'sudo (passwordless)'; elif $CAN_SUDO_PASS; then echo 'sudo (password required)'; else echo 'no'; fi)"
 echo "  Docker available:  $(if $HAS_DOCKER; then echo 'yes'; else echo 'no'; fi)"
 echo "  Inside container:  $(if $IN_CONTAINER; then echo 'yes'; else echo 'no'; fi)"
 echo "  Architecture:      $ARCH"
 echo "  Total RAM:         ${TOTAL_RAM_MB} MB"
-if $IS_PI_CLASS; then
-echo "  Hardware class:    Pi-class (ARM64, <16GB RAM)"
-fi
 echo "  Repo directory:    $REPO_DIR"
 echo "  Base directory:    $BASE_DIR"
 echo ""
@@ -352,6 +337,12 @@ echo ""
 # ══════════════════════════════════════════════════════════════════════
 info "Creating directory structure under $BASE_DIR ..."
 
+#
+# NOTE: Keep this list minimal.  Anything under config/ that the server seeds
+# (see carpenter.seed.SEED_MANIFEST) or derives from base_dir MUST NOT be
+# pre-created here — pre-creating a seed target silently breaks
+# shutil.copytree() in the seed installer, which refuses to overwrite an
+# existing directory.  The server creates every other path it needs lazily.
 DIRS=(
     "$BASE_DIR"
     "$BASE_DIR/data"
@@ -359,12 +350,6 @@ DIRS=(
     "$BASE_DIR/data/code"
     "$BASE_DIR/data/workspaces"
     "$BASE_DIR/config"
-    "$BASE_DIR/config/templates"
-    "$BASE_DIR/config/tools"
-    "$BASE_DIR/config/skills"
-    "$BASE_DIR/config/kb"
-    "$BASE_DIR/config/prompts"
-    "$BASE_DIR/data_models"
 )
 
 for dir in "${DIRS[@]}"; do
@@ -458,51 +443,25 @@ OLLAMA_MODEL_FINAL=""
 
 if [[ -z "$AI_PROVIDER" ]]; then
     if $NON_INTERACTIVE; then
-        if $IS_PI_CLASS && ! $IN_CONTAINER; then
-            AI_PROVIDER="local"
-            info "Auto-selecting local provider for Pi-class hardware"
-        else
-            AI_PROVIDER="skip"
-            info "Skipping AI provider configuration (non-interactive mode)"
-        fi
+        AI_PROVIDER="skip"
+        info "Skipping AI provider configuration (non-interactive mode)"
     else
         echo ""
         info "AI Provider:"
-        if $IS_PI_CLASS; then
-            echo "  1) Local (llama.cpp) -- runs on this device, no API key needed (recommended)"
-            echo "  2) Anthropic (Claude) -- requires API key"
-            echo "  3) Ollama (local)     -- requires running Ollama server"
-            echo "  4) Tinfoil            -- secure enclave inference, requires API key"
-            echo "  5) Skip               -- configure later"
-            echo ""
-            read -r -p "  Choose AI provider [1]: " AI_CHOICE
-            AI_CHOICE="${AI_CHOICE:-1}"
-            case "$AI_CHOICE" in
-                1) AI_PROVIDER="local" ;;
-                2) AI_PROVIDER="anthropic" ;;
-                3) AI_PROVIDER="ollama" ;;
-                4) AI_PROVIDER="tinfoil" ;;
-                5) AI_PROVIDER="skip" ;;
-                *) error "Invalid choice: $AI_CHOICE" ;;
-            esac
-        else
-            echo "  1) Anthropic (Claude) -- requires API key"
-            echo "  2) Ollama (local)     -- requires running Ollama server"
-            echo "  3) Tinfoil            -- secure enclave inference, requires API key"
-            echo "  4) Local (llama.cpp)  -- runs on this device, no API key needed"
-            echo "  5) Skip               -- configure later"
-            echo ""
-            read -r -p "  Choose AI provider [5]: " AI_CHOICE
-            AI_CHOICE="${AI_CHOICE:-5}"
-            case "$AI_CHOICE" in
-                1) AI_PROVIDER="anthropic" ;;
-                2) AI_PROVIDER="ollama" ;;
-                3) AI_PROVIDER="tinfoil" ;;
-                4) AI_PROVIDER="local" ;;
-                5) AI_PROVIDER="skip" ;;
-                *) error "Invalid choice: $AI_CHOICE" ;;
-            esac
-        fi
+        echo "  1) Anthropic (Claude) -- requires API key"
+        echo "  2) Ollama             -- requires running Ollama server"
+        echo "  3) Tinfoil            -- secure enclave inference, requires API key"
+        echo "  4) Skip               -- configure later"
+        echo ""
+        read -r -p "  Choose AI provider [4]: " AI_CHOICE
+        AI_CHOICE="${AI_CHOICE:-4}"
+        case "$AI_CHOICE" in
+            1) AI_PROVIDER="anthropic" ;;
+            2) AI_PROVIDER="ollama" ;;
+            3) AI_PROVIDER="tinfoil" ;;
+            4) AI_PROVIDER="skip" ;;
+            *) error "Invalid choice: $AI_CHOICE" ;;
+        esac
     fi
 fi
 
@@ -571,17 +530,22 @@ PYEOF
             warn "Could not reach Ollama server at $OLLAMA_URL_FINAL. Continuing anyway."
         fi
 
-        # Model
-        if [[ -n "$OLLAMA_MODEL" && "$OLLAMA_MODEL" != "llama3.1" ]] || $NON_INTERACTIVE; then
-            # CLI-provided or non-interactive: use the value we have
+        # Model — Carpenter ships no default LLM. Require the user to
+        # explicitly supply one (CLI flag, non-interactive env, or
+        # interactive prompt). The available-models list is shown for
+        # reference only; we never auto-pick from it.
+        if [[ -n "$OLLAMA_MODEL" ]]; then
+            # CLI-provided value wins (whether or not interactive).
             OLLAMA_MODEL_FINAL="$OLLAMA_MODEL"
-        elif $OLLAMA_REACHABLE && ! $NON_INTERACTIVE; then
-            # List available models and let user pick
-            echo ""
-            echo "  Available models on Ollama server:"
-            MODELS_JSON="$(curl -s --connect-timeout 5 "$OLLAMA_URL_FINAL/api/tags" 2>/dev/null || echo '{}')"
-            if command -v python3 &>/dev/null; then
-                MODEL_LIST="$(python3 -c "
+        elif $NON_INTERACTIVE; then
+            error "Ollama provider requires --ollama-model in non-interactive mode (no default ships)."
+        else
+            if $OLLAMA_REACHABLE; then
+                echo ""
+                echo "  Available models on Ollama server (for reference):"
+                MODELS_JSON="$(curl -s --connect-timeout 5 "$OLLAMA_URL_FINAL/api/tags" 2>/dev/null || echo '{}')"
+                if command -v python3 &>/dev/null; then
+                    MODEL_LIST="$(python3 -c "
 import json, sys
 try:
     data = json.loads(sys.stdin.read())
@@ -593,14 +557,18 @@ try:
 except Exception:
     print('    (could not parse model list)')
 " <<< "$MODELS_JSON")"
-                echo "$MODEL_LIST"
+                    echo "$MODEL_LIST"
+                fi
                 echo ""
-                OLLAMA_MODEL_FINAL="$(ask "  Enter model name" "$OLLAMA_MODEL")"
-            else
-                OLLAMA_MODEL_FINAL="$OLLAMA_MODEL"
             fi
-        else
-            OLLAMA_MODEL_FINAL="$(ask "  Ollama model name" "$OLLAMA_MODEL")"
+            # No default — the user must type a name. Loop until they do.
+            while [[ -z "$OLLAMA_MODEL_FINAL" ]]; do
+                read -r -p "  Enter Ollama model name (e.g. qwen3:8b, llama3.1:8b): " OLLAMA_MODEL_FINAL
+                OLLAMA_MODEL_FINAL="$(echo "$OLLAMA_MODEL_FINAL" | tr -d '[:space:]')"
+                if [[ -z "$OLLAMA_MODEL_FINAL" ]]; then
+                    warn "Model name is required — Carpenter ships no default."
+                fi
+            done
         fi
 
         success "  Ollama URL: $OLLAMA_URL_FINAL"
@@ -637,148 +605,12 @@ CRED
         success "  API key written to $CREDENTIAL_FILE"
         ;;
 
-    local)
-        info "Configuring local inference (llama.cpp) provider..."
-
-        # ── Locate or build llama-server ──
-        LLAMA_SERVER_PATH=""
-        if command -v llama-server &>/dev/null; then
-            LLAMA_SERVER_PATH="$(command -v llama-server)"
-            success "  Found llama-server: $LLAMA_SERVER_PATH"
-        else
-            info "  llama-server not found in PATH."
-            LLAMA_CPP_DIR="$BASE_DIR/llama.cpp"
-
-            if [[ -x "$LLAMA_CPP_DIR/build/bin/llama-server" ]]; then
-                LLAMA_SERVER_PATH="$LLAMA_CPP_DIR/build/bin/llama-server"
-                success "  Found existing build: $LLAMA_SERVER_PATH"
-            else
-                info "  Building llama.cpp from source..."
-
-                # Check prerequisites
-                for dep in cmake g++; do
-                    if ! command -v "$dep" &>/dev/null; then
-                        error "Required build tool '$dep' not found. Install it with: sudo apt install cmake g++"
-                    fi
-                done
-
-                if [[ -d "$LLAMA_CPP_DIR" ]]; then
-                    info "  Updating existing llama.cpp clone..."
-                    (cd "$LLAMA_CPP_DIR" && git pull --ff-only 2>/dev/null) || true
-                else
-                    info "  Cloning llama.cpp..."
-                    git clone --depth 1 https://github.com/ggerganov/llama.cpp "$LLAMA_CPP_DIR"
-                fi
-
-                info "  Building (this may take a few minutes)..."
-                cmake -S "$LLAMA_CPP_DIR" -B "$LLAMA_CPP_DIR/build" -DCMAKE_BUILD_TYPE=Release -DGGML_CPU_AARCH64=ON 2>&1 | tail -3
-                cmake --build "$LLAMA_CPP_DIR/build" --target llama-server -j "$(nproc)" 2>&1 | tail -5
-
-                if [[ -x "$LLAMA_CPP_DIR/build/bin/llama-server" ]]; then
-                    LLAMA_SERVER_PATH="$LLAMA_CPP_DIR/build/bin/llama-server"
-                    success "  Built llama-server: $LLAMA_SERVER_PATH"
-                else
-                    error "Build failed. Check the output above for errors."
-                fi
-            fi
-        fi
-
-        # ── Model selection ──
-        echo ""
-        info "  Select a model (Q4_K_M quantization):"
-        echo ""
-        echo "  1) Qwen 2.5 1.5B   (~1.0 GB, ~8-12 tok/s on Pi5)   — limited tool use"
-        echo "  2) Gemma 2 2B       (~1.6 GB, ~3-5 tok/s on Pi5)"
-        echo "  3) Qwen 2.5 3B     (~2.0 GB, ~3-5 tok/s on Pi5)    — recommended"
-        echo "  4) Phi-3.5 Mini    (~2.2 GB, ~3.4 tok/s on Pi5)"
-        echo ""
-
-        # Recommend model based on available RAM
-        if [[ -n "$LOCAL_MODEL" ]]; then
-            # CLI-provided model
-            LOCAL_MODEL_CHOICE="$LOCAL_MODEL"
-        elif $NON_INTERACTIVE; then
-            # Auto-select based on RAM
-            if [[ "$TOTAL_RAM_MB" -lt 4096 ]]; then
-                LOCAL_MODEL_CHOICE="1"
-            elif [[ "$TOTAL_RAM_MB" -lt 6144 ]]; then
-                LOCAL_MODEL_CHOICE="2"
-            else
-                LOCAL_MODEL_CHOICE="3"
-            fi
-            info "  Auto-selected model $LOCAL_MODEL_CHOICE based on ${TOTAL_RAM_MB}MB RAM"
-        else
-            # Recommend based on RAM
-            RECOMMENDED="3"
-            if [[ "$TOTAL_RAM_MB" -lt 4096 ]]; then
-                RECOMMENDED="1"
-            elif [[ "$TOTAL_RAM_MB" -lt 6144 ]]; then
-                RECOMMENDED="2"
-            fi
-            read -r -p "  Choose model [$RECOMMENDED]: " LOCAL_MODEL_CHOICE
-            LOCAL_MODEL_CHOICE="${LOCAL_MODEL_CHOICE:-$RECOMMENDED}"
-        fi
-
-        # Map choice to catalog key and HuggingFace details
-        LOCAL_MODEL_KEY=""
-        LOCAL_HF_REPO=""
-        LOCAL_HF_FILE=""
-        case "$LOCAL_MODEL_CHOICE" in
-            1|qwen2.5-1.5b-q4)
-                LOCAL_MODEL_KEY="qwen2.5-1.5b-q4"
-                LOCAL_HF_REPO="Qwen/Qwen2.5-1.5B-Instruct-GGUF"
-                LOCAL_HF_FILE="qwen2.5-1.5b-instruct-q4_k_m.gguf"
-                ;;
-            2|gemma2-2b-q4)
-                LOCAL_MODEL_KEY="gemma2-2b-q4"
-                LOCAL_HF_REPO="google/gemma-2-2b-it-GGUF"
-                LOCAL_HF_FILE="gemma-2-2b-it-q4_k_m.gguf"
-                ;;
-            3|qwen2.5-3b-q4)
-                LOCAL_MODEL_KEY="qwen2.5-3b-q4"
-                LOCAL_HF_REPO="Qwen/Qwen2.5-3B-Instruct-GGUF"
-                LOCAL_HF_FILE="qwen2.5-3b-instruct-q4_k_m.gguf"
-                ;;
-            4|phi3.5-mini-q4)
-                LOCAL_MODEL_KEY="phi3.5-mini-q4"
-                LOCAL_HF_REPO="microsoft/Phi-3.5-mini-instruct-GGUF"
-                LOCAL_HF_FILE="Phi-3.5-mini-instruct-Q4_K_M.gguf"
-                ;;
-            *)
-                error "Invalid model choice: $LOCAL_MODEL_CHOICE"
-                ;;
-        esac
-
-        # ── Download GGUF ──
-        MODELS_DIR="$BASE_DIR/models"
-        mkdir -p "$MODELS_DIR"
-        LOCAL_MODEL_PATH="$MODELS_DIR/$LOCAL_HF_FILE"
-
-        if [[ -f "$LOCAL_MODEL_PATH" ]]; then
-            success "  Model already downloaded: $LOCAL_MODEL_PATH"
-        else
-            HF_URL="https://huggingface.co/$LOCAL_HF_REPO/resolve/main/$LOCAL_HF_FILE"
-            info "  Downloading $LOCAL_HF_FILE ..."
-            echo "  URL: $HF_URL"
-            if curl -L -C - --progress-bar -o "$LOCAL_MODEL_PATH" "$HF_URL"; then
-                success "  Downloaded: $LOCAL_MODEL_PATH"
-            else
-                rm -f "$LOCAL_MODEL_PATH"
-                error "Download failed. Check your internet connection and try again."
-            fi
-        fi
-
-        success "  Local provider configured:"
-        success "    Binary: $LLAMA_SERVER_PATH"
-        success "    Model:  $LOCAL_MODEL_PATH ($LOCAL_MODEL_KEY)"
-        ;;
-
     skip)
         echo "  You can configure AI later by editing $BASE_DIR/config/config.yaml"
         ;;
 
     *)
-        error "Unknown AI provider: $AI_PROVIDER. Use 'anthropic', 'ollama', 'tinfoil', 'local', or 'skip'."
+        error "Unknown AI provider: $AI_PROVIDER. Use 'anthropic', 'ollama', 'tinfoil', or 'skip'."
         ;;
 esac
 
@@ -1180,37 +1012,6 @@ tinfoil_model: llama3-3-70b"
   reflection_weekly: \"\"
   reflection_monthly: \"\""
         ;;
-    local)
-        # Derive model name from GGUF filename (strip extension)
-        LOCAL_MODEL_BASENAME="${LOCAL_HF_FILE%.gguf}"
-        AI_CONFIG="ai_provider: local
-local_llama_cpp_path: $LLAMA_SERVER_PATH
-local_model_path: $LOCAL_MODEL_PATH
-local_server_port: $INFERENCE_PORT
-local_server_host: 127.0.0.1
-local_context_size: 8192
-local_gpu_layers: 0
-local_parallel: 1
-local_repack: auto
-local_startup_timeout: 120"
-        MODEL_ROLES_BLOCK="model_roles:
-  default: local:$LOCAL_MODEL_BASENAME
-  chat: local:$LOCAL_MODEL_BASENAME
-  default_step: local:$LOCAL_MODEL_BASENAME
-  title: local:$LOCAL_MODEL_BASENAME
-  summary: local:$LOCAL_MODEL_BASENAME
-  compaction: local:$LOCAL_MODEL_BASENAME
-  code_review: local:$LOCAL_MODEL_BASENAME
-  review_judge: \"\"
-  reflection_daily: \"\"
-  reflection_weekly: \"\"
-  reflection_monthly: \"\"
-
-# Context windows — token limits per provider/model for compaction and prompt sizing
-context_windows:
-  local: 8192
-  anthropic: 200000"
-        ;;
     skip)
         AI_CONFIG="# ai_provider: not configured (run install.sh again or edit manually)"
         MODEL_ROLES_BLOCK="# model_roles: not configured (set ai_provider first)
@@ -1285,15 +1086,14 @@ cat > "$CONFIG_FILE" <<YAML
 # Configuration precedence: credential env vars (ANTHROPIC_API_KEY, etc.) > {base_dir}/.env > this file > built-in defaults
 # See carpenter/config.py for all available keys.
 
+# base_dir is the only path the installer sets.  All other layout-dependent
+# paths (database_path, log_dir, code_dir, workspaces_dir, templates_dir,
+# tools_dir, data_models_dir, prompts_dir, coding_prompts_dir, kb.dir, ...)
+# are derived from base_dir by the server at startup.  See
+# carpenter/config.py::_DERIVED_PATH_DEFAULTS for the full mapping.
+#
+# To override a derived path, set it explicitly in this file.
 base_dir: $BASE_DIR
-database_path: $BASE_DIR/data/platform.db
-log_dir: $BASE_DIR/data/logs
-code_dir: $BASE_DIR/data/code
-workspaces_dir: $BASE_DIR/data/workspaces
-templates_dir: $BASE_DIR/config/templates
-tools_dir: $BASE_DIR/config/tools
-skills_dir: $BASE_DIR/config/skills
-data_models_dir: $BASE_DIR/data_models
 
 sandbox:
   method: $SANDBOX_METHOD
