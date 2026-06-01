@@ -172,20 +172,20 @@ default_coding_agent: builtin
 coding_agents:
   builtin:
     type: builtin
-    model: claude-haiku-4-5-20251001
+    model: claude-haiku-4-5
     max_tokens: 4096
     max_iterations: 20
     timeout: 300
 
 model_roles:
-  default: claude-haiku-4-5-20251001
-  chat: anthropic:claude-haiku-4-5-20251001
-  default_step: claude-haiku-4-5-20251001
-  title: claude-haiku-4-5-20251001
-  summary: claude-haiku-4-5-20251001
-  compaction: claude-haiku-4-5-20251001
-  code_review: claude-haiku-4-5-20251001
-  review_judge: claude-haiku-4-5-20251001
+  default: claude-haiku-4-5
+  chat: anthropic:claude-haiku-4-5
+  default_step: claude-haiku-4-5
+  title: claude-haiku-4-5
+  summary: claude-haiku-4-5
+  compaction: claude-haiku-4-5
+  code_review: claude-haiku-4-5
+  review_judge: claude-haiku-4-5
 
 review_auto_approve_threshold: 0
 

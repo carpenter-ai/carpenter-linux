@@ -22,16 +22,11 @@ Platform capabilities required (any of these approaches):
   - scheduling.add_cron with a mechanism for the arc to remove itself
       after firing (the recurring workaround).
 
-Known gaps as of 2026-03-18:
-  - scheduling.add_once does not exist; only recurring add_cron is available.
+Notes:
   - Cron expressions have 1-minute resolution — a cron targeting :XX minutes
     may fire up to 59 seconds late.
   - A recurring cron entry will re-fire at the same time every day unless the
     arc removes it after first delivery.
-
-This story will FAIL if those gaps have not been addressed.  The failure
-diagnostic will show which step blocked progress, making it a useful
-specification for the feature work required.
 
 Cleanup: removes any cron_entries created during this test by name prefix
 "s006-reminder" so the test is safe to re-run.
@@ -47,7 +42,6 @@ from user_stories.framework import (
     CarpenterClient,
 )
 
-_CRON_NAME_PREFIX = "s006-reminder"
 _REMINDER_TEXT = "time to take a break"
 
 # How far in the future to schedule the reminder.
@@ -60,7 +54,7 @@ _REMIND_IN_MINUTES = 2
 _WAIT_FOR_REMINDER_SECONDS = _REMIND_IN_MINUTES * 60 * 4 + 90  # ~9 min max
 
 
-def _build_prompt(target_dt: datetime) -> str:
+def _build_prompt(target_dt: datetime, cron_name: str) -> str:
     """Return the natural-language reminder request with an explicit time."""
     time_str = target_dt.strftime("%H:%M")  # e.g. "14:37"
     return (
@@ -69,7 +63,9 @@ def _build_prompt(target_dt: datetime) -> str:
         f"Send me a chat message in this conversation at that time. "
         f"Use the scheduling tools to create a trigger that fires at {time_str}. "
         f"The reminder should fire once and not repeat daily. "
-        f"The message should say 'Time to take a break!'."
+        f"The message should say 'Time to take a break!'. "
+        f"Please name the cron/schedule entry `{cron_name}` so it's easy "
+        f"to identify as a test artifact."
     )
 
 
@@ -79,11 +75,13 @@ class RemindMeAtTime(AcceptanceStory):
         "User asks for a 2-minute reminder; agent sets a one-shot schedule; "
         "platform delivers the message; story verifies arrival and cleanup."
     )
+    artifact_prefix = "s006"
 
     def run(self, client: CarpenterClient, db: DBInspector) -> StoryResult:
         start_ts = time.time()
         target_dt = datetime.now() + timedelta(minutes=_REMIND_IN_MINUTES)
-        prompt = _build_prompt(target_dt)
+        cron_name = self.artifact_name("reminder")
+        prompt = _build_prompt(target_dt, cron_name)
 
         # ── 1. Send reminder request ──────────────────────────────────────────
         print(f"\n  [1/3] Requesting reminder at {target_dt.strftime('%H:%M')}...")
@@ -144,7 +142,7 @@ class RemindMeAtTime(AcceptanceStory):
             all_messages=[m.get("content", "")[:80] for m in
                           client.get_assistant_messages(conv_id)],
             # --- gap analysis hints ---
-            hint_1="Does scheduling.add_once exist? (only add_cron available as of 2026-03-18)",
+            hint_1="Was scheduling.add_once called? Check cron_entries table for a one-shot entry.",
             hint_2="Was a cron entry created? Check cron_entries table.",
             hint_3="Was an arc created and dispatched at the right time?",
         )
@@ -177,7 +175,7 @@ class RemindMeAtTime(AcceptanceStory):
         # (A well-behaved one-shot reminder cleans up after itself.)
         leftover_crons = db._query(
             "SELECT * FROM cron_entries WHERE name LIKE ? AND enabled = 1",
-            (f"{_CRON_NAME_PREFIX}%",),
+            (self.artifact_name_pattern(),),
         )
         self.assert_that(
             len(leftover_crons) == 0,
@@ -198,20 +196,21 @@ class RemindMeAtTime(AcceptanceStory):
         )
 
     def cleanup(self, client: CarpenterClient, db: DBInspector) -> None:
-        """Remove any cron entries created by this story so it doesn't repeat."""
+        """Remove any cron entries created by this run so it doesn't repeat."""
         if db is None:
             return
         import sqlite3
+        pattern = self.artifact_name_pattern()
         try:
             conn = sqlite3.connect(db.db_path)
             try:
                 cur = conn.execute(
                     "DELETE FROM cron_entries WHERE name LIKE ?",
-                    (f"{_CRON_NAME_PREFIX}%",),
+                    (pattern,),
                 )
                 if cur.rowcount:
                     print(f"  [cleanup] Removed {cur.rowcount} cron entry/entries "
-                          f"matching '{_CRON_NAME_PREFIX}%'")
+                          f"matching '{pattern}'")
                 conn.commit()
             finally:
                 conn.close()

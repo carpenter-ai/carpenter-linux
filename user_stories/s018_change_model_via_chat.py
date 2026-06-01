@@ -25,6 +25,7 @@ The cleanup() method restores the original value if the test fails mid-way.
 """
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -41,11 +42,14 @@ from user_stories.framework import (
     CarpenterClient,
 )
 
-_CONFIG_PATH = Path.home() / "carpenter" / "config" / "config.yaml"
+_CONFIG_PATH = Path(os.environ.get(
+    "CARPENTER_CONFIG",
+    Path.home() / "carpenter" / "config" / "config.yaml"
+))
 
 # Two models to switch between — both Anthropic, both cheap enough for testing.
-_MODEL_A = "claude-haiku-4-5-20251001"
-_MODEL_B = "claude-sonnet-4-20250514"
+_MODEL_A = "claude-haiku-4-5"
+_MODEL_B = "claude-sonnet-4-6"
 
 _CHANGE_PROMPT = (
     "Please change the chat model to `{target}`. "

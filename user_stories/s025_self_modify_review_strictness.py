@@ -20,6 +20,7 @@ DB verification:
   - Revert was applied.
 """
 
+import os
 import time
 from pathlib import Path
 
@@ -36,7 +37,10 @@ from user_stories.framework import (
     CarpenterClient,
 )
 
-_CONFIG_PATH = Path.home() / "carpenter" / "config" / "config.yaml"
+_CONFIG_PATH = Path(os.environ.get(
+    "CARPENTER_CONFIG",
+    Path.home() / "carpenter" / "config" / "config.yaml"
+))
 _CONFIG_KEY = "review_auto_approve_threshold"
 
 _RELAX_PROMPT = (

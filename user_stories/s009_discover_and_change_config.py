@@ -23,6 +23,7 @@ NOTE: This story writes and reverts ~/carpenter/config/config.yaml.  The
 cleanup() method restores the default value if the test fails mid-way.
 """
 
+import os
 import time
 from pathlib import Path
 
@@ -41,7 +42,10 @@ from user_stories.framework import (
 
 _CONFIG_KEY = "memory_recent_hints"
 _ORIGINAL_VALUE = 3
-_CONFIG_PATH = Path.home() / "carpenter" / "config" / "config.yaml"
+_CONFIG_PATH = Path(os.environ.get(
+    "CARPENTER_CONFIG",
+    Path.home() / "carpenter" / "config" / "config.yaml"
+))
 
 _DISCOVER_AND_CHANGE_PROMPT = (
     "I feel like you've been losing track of what we've been working on lately. "

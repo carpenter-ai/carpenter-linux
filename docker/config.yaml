@@ -12,9 +12,9 @@
 #   built-in defaults < this file < {base_dir}/.env < environment variables
 #
 # Available models (for model_roles and coding_agents):
-#   claude-haiku-4-5-20251001    (fast, cheap)
-#   claude-sonnet-4-5-20250929   (balanced)
-#   claude-opus-4-6              (most capable)
+#   claude-haiku-4-5    (fast, cheap)
+#   claude-sonnet-4-6   (balanced)
+#   claude-opus-4-7     (most capable)
 
 # ─── Directory layout ────────────────────────────────────────────────
 # All paths use /carpenter prefix (the Docker WORKDIR).
@@ -56,15 +56,15 @@ ai_provider: anthropic
 # Format: "provider:model" or just "model" (uses ai_provider).
 # Empty string ("") falls back to the "default" slot.
 model_roles:
-  default: claude-haiku-4-5-20251001
-  chat: anthropic:claude-haiku-4-5-20251001
-  default_step: claude-haiku-4-5-20251001
-  title: claude-haiku-4-5-20251001
-  summary: claude-haiku-4-5-20251001
-  compaction: claude-haiku-4-5-20251001
-  code_review: claude-haiku-4-5-20251001
-  review_judge: claude-haiku-4-5-20251001
-  reflection_daily: claude-haiku-4-5-20251001
+  default: claude-haiku-4-5
+  chat: anthropic:claude-haiku-4-5
+  default_step: claude-haiku-4-5
+  title: claude-haiku-4-5
+  summary: claude-haiku-4-5
+  compaction: claude-haiku-4-5
+  code_review: claude-haiku-4-5
+  review_judge: claude-haiku-4-5
+  reflection_daily: claude-haiku-4-5
   reflection_weekly: ""
   reflection_monthly: ""
 
@@ -72,21 +72,21 @@ model_roles:
 models:
   opus:
     provider: anthropic
-    model_id: claude-opus-4-6
+    model_id: claude-opus-4-7
     description: "Most capable model. Deep reasoning, architecture decisions, security review."
     cost_tier: high
     context_window: 200000
     roles: [planning, review, implementation]
   sonnet:
     provider: anthropic
-    model_id: claude-sonnet-4-5-20250929
+    model_id: claude-sonnet-4-6
     description: "Balanced capability and cost. Standard implementation, code review."
     cost_tier: medium
     context_window: 200000
     roles: [planning, review, implementation, documentation]
   haiku:
     provider: anthropic
-    model_id: claude-haiku-4-5-20251001
+    model_id: claude-haiku-4-5
     description: "Fast and cheap. Summarization, simple code generation, formatting."
     cost_tier: low
     context_window: 200000
@@ -94,7 +94,6 @@ models:
 
 # Context windows -- token limits per provider for compaction and prompt sizing
 context_windows:
-  local: 16384
   ollama: 16384
   tinfoil: 8192
   anthropic: 200000
@@ -189,18 +188,6 @@ arc_retry:
     VerificationError: false
     default: false
 
-# ─── Local fallback (optional) ───────────────────────────────────────
-local_fallback:
-  enabled: false
-  provider: ollama
-  url: ""
-  model: "qwen3.5:9b"
-  context_window: 16384
-  timeout: 300
-  max_tokens: 4096
-  allowed_operations: [chat, summarization, simple_code]
-  blocked_operations: [review, security_review, planning]
-
 # ─── Knowledge base ─────────────────────────────────────────────────
 kb:
   enabled: true
@@ -264,7 +251,7 @@ default_coding_agent: builtin
 coding_agents:
   builtin:
     type: builtin
-    model: claude-haiku-4-5-20251001
+    model: claude-haiku-4-5
     max_tokens: 4096
     max_iterations: 20
     timeout: 300

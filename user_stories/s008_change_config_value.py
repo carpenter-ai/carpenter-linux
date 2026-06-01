@@ -1,34 +1,31 @@
 """
 S008 — User Changes a Platform Configuration Value
 
-The user asks Carpenter to change the `memory_recent_hints` configuration
-value (how many recent conversation titles appear in the agent's context).
-The user knows the config key by name and states the desired value.
+The user asks Carpenter (in natural language) to change how many recent
+conversation titles appear in the agent's context — naming the config key
+they care about and the value they want. They do not tell the agent which
+tool to use or what code to write; the agent figures out the right
+mechanism for changing platform configuration.
 
-The agent submits reviewed code that calls
-``from carpenter_tools.act import config as cfg_tool; cfg_tool.set_value(key, value)``.
-The platform-side handler writes to ~/carpenter/config/config.yaml and
-immediately hot-reloads the in-memory CONFIG without a server restart.
+The platform's config-change path writes to ~/carpenter/config/config.yaml
+and hot-reloads the in-memory CONFIG without a server restart.
 
-The story verifies the live value by asking the agent to submit verification
-code that reads ``config.CONFIG.get(key)`` directly.
+The story then verifies the value actually changed (on disk and live) and
+asks the user to revert. The agent restores the default. The story
+re-verifies.
 
-Then the user asks to revert.  The agent sets the value back to the default (3),
-hot-reloads, and confirms.  The story verifies the restored value.
-
-Health checks:
-  - Arc history is clean — the agent checks via list_arcs or arc.get_history.
-  - No arc from this session reaches failed/cancelled status.
+Health check: no arc from this session reaches failed/cancelled.
 
 Config key:  memory_recent_hints
 Original:    3  (platform default; not set in ~/carpenter/config/config.yaml)
 Changed to:  7
 Reverted to: 3
 
-NOTE: This story writes and reverts ~/carpenter/config/config.yaml.  The
+NOTE: This story writes and reverts ~/carpenter/config/config.yaml. The
 cleanup() method restores the default value if the test fails mid-way.
 """
 
+import os
 import time
 from pathlib import Path
 
@@ -48,34 +45,26 @@ from user_stories.framework import (
 _CONFIG_KEY = "memory_recent_hints"
 _ORIGINAL_VALUE = 3
 _NEW_VALUE = 7
-_CONFIG_PATH = Path.home() / "carpenter" / "config" / "config.yaml"
+_CONFIG_PATH = Path(os.environ.get(
+    "CARPENTER_CONFIG",
+    Path.home() / "carpenter" / "config" / "config.yaml"
+))
 
 _CHANGE_PROMPT = (
-    f"Please change the `{_CONFIG_KEY}` configuration value to {_NEW_VALUE}. "
-    f"Use the config tool to do this: submit code that calls "
-    f"`from carpenter_tools.act import config as cfg_tool; "
-    f"result = cfg_tool.set_value('{_CONFIG_KEY}', {_NEW_VALUE}); print(result)`. "
-    f"Confirm when the code executes successfully."
+    f"Bump `{_CONFIG_KEY}` to {_NEW_VALUE} please — let me know once it's done."
 )
 
 _VERIFY_PROMPT = (
-    f"Please submit code to verify the current live value of `{_CONFIG_KEY}`. "
-    f"Run: `from carpenter_tools.read import config as cfg_tool; "
-    f"result = cfg_tool.get_value('{_CONFIG_KEY}'); print(result['value'])`"
+    f"What's `{_CONFIG_KEY}` currently set to? Tell me the live value."
 )
 
 _REVERT_PROMPT = (
-    f"Please revert `{_CONFIG_KEY}` back to {_ORIGINAL_VALUE}. "
-    f"Submit code that calls "
-    f"`from carpenter_tools.act import config as cfg_tool; "
-    f"result = cfg_tool.set_value('{_CONFIG_KEY}', {_ORIGINAL_VALUE}); print(result)`. "
-    f"Confirm when done."
+    f"Put `{_CONFIG_KEY}` back to {_ORIGINAL_VALUE}."
 )
 
 _ARC_HEALTH_PROMPT = (
-    "Please check the recent arc history and confirm there are no unexpected "
-    "failures, cancelled arcs, or repeated retry patterns from the config "
-    "change operations we just performed."
+    "Anything unexpected in the recent activity from those config changes? "
+    "Just want to make sure nothing went sideways."
 )
 
 

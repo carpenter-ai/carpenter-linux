@@ -21,6 +21,7 @@ NOTE: This story modifies escalation config in ~/carpenter/config/config.yaml.
       Cleanup restores the original config.
 """
 
+import os
 import time
 from pathlib import Path
 
@@ -37,10 +38,13 @@ try:
 except ImportError:
     _HAS_YAML = False
 
-_CONFIG_PATH = Path.home() / "carpenter" / "config" / "config.yaml"
+_CONFIG_PATH = Path(os.environ.get(
+    "CARPENTER_CONFIG",
+    Path.home() / "carpenter" / "config" / "config.yaml"
+))
 
-_HAIKU = "claude-haiku-4-5-20251001"
-_SONNET = "claude-sonnet-4-5-20250929"
+_HAIKU = "claude-haiku-4-5"
+_SONNET = "claude-sonnet-4-6"
 
 _ESCALATION_PROMPT = (
     "Create a single arc with the following goal: "

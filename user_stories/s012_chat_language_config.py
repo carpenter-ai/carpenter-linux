@@ -27,6 +27,7 @@ NOTE: This story writes and reverts ~/carpenter/config/config.yaml.  The
 cleanup() method restores the empty-string default if the test fails mid-way.
 """
 
+import os
 import time
 from pathlib import Path
 
@@ -46,7 +47,10 @@ from user_stories.framework import (
 _CONFIG_KEY = "chat_language"
 _ORIGINAL_VALUE = ""
 _TARGET_VALUE = "de"
-_CONFIG_PATH = Path.home() / "carpenter" / "config" / "config.yaml"
+_CONFIG_PATH = Path(os.environ.get(
+    "CARPENTER_CONFIG",
+    Path.home() / "carpenter" / "config" / "config.yaml"
+))
 
 _SET_PROMPT = (
     "Please set the chat_language config value to 'de' and confirm when done."
