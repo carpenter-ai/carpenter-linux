@@ -828,6 +828,85 @@ class DBInspector:
         )
         return rows[0]["template_name"] if rows else None
 
+    def get_verification_arcs_for(
+        self, implementation_arc_id: int
+    ) -> list[dict]:
+        """Return verification sibling arcs targeting *implementation_arc_id*.
+
+        Verifier arcs (``lint-yaml``, ``verify-kb-format``,
+        ``judge-verification``, ``post-verification-docs``, etc.) share
+        the implementation arc's ``parent_id`` and link back via
+        ``arcs.verification_target_id``. They are NOT children of the
+        implementation arc — using ``get_arc_children`` to find them
+        will incorrectly return an empty list.
+
+        Returns the verifier rows ordered by ``step_order`` (which the
+        workflow template assigns).
+        """
+        return self._query(
+            "SELECT * FROM arcs "
+            "WHERE verification_target_id = ? "
+            "ORDER BY COALESCE(step_order, 0), id",
+            (implementation_arc_id,),
+        )
+
+    def get_verification_arc_by_role(
+        self, implementation_arc_id: int, step_role: str
+    ) -> dict | None:
+        """Return the verifier arc with the given ``step_role`` (or name).
+
+        Falls back to matching on ``arcs.name`` when ``step_role`` is
+        unpopulated. Returns the first match by ``step_order``.
+        """
+        rows = self._query(
+            "SELECT * FROM arcs "
+            "WHERE verification_target_id = ? AND step_role = ? "
+            "ORDER BY COALESCE(step_order, 0), id LIMIT 1",
+            (implementation_arc_id, step_role),
+        )
+        if rows:
+            return rows[0]
+        rows = self._query(
+            "SELECT * FROM arcs "
+            "WHERE verification_target_id = ? AND name = ? "
+            "ORDER BY COALESCE(step_order, 0), id LIMIT 1",
+            (implementation_arc_id, step_role),
+        )
+        return rows[0] if rows else None
+
+    # --- Trust audit log queries ---
+
+    def get_workflow_selected_event_after(
+        self, since_ts: float
+    ) -> dict | None:
+        """Return the most recent ``integrity.workflow_selected`` event.
+
+        Reads ``trust_audit_log`` filtered to events at/after ``since_ts``
+        and decodes ``details_json``. Used by change-style stories to
+        verify which workflow template was picked
+        (``coding-change``, ``yaml-change``, ``kb-change``, …) by the
+        path classifier — see
+        :func:`carpenter.security.platform_paths.select_workflow_for_paths`.
+
+        Returns the decoded details dict (with an extra ``"_id"`` key
+        carrying the row id) or ``None`` if no such event exists.
+        """
+        since_iso = datetime.fromtimestamp(
+            since_ts, tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        rows = self._query(
+            "SELECT id, details_json FROM trust_audit_log "
+            "WHERE event_type = 'integrity.workflow_selected' "
+            "AND created_at >= ? "
+            "ORDER BY id DESC LIMIT 1",
+            (since_iso,),
+        )
+        if not rows:
+            return None
+        details = json.loads(rows[0]["details_json"] or "{}")
+        details["_id"] = rows[0]["id"]
+        return details
+
     # --- Generic query ---
 
     def fetchall(self, sql: str, params: tuple = ()) -> list[dict]:
@@ -1043,3 +1122,215 @@ class AcceptanceStory:
     def result(self, message: str = "") -> "StoryResult":
         """Return a passing StoryResult for this story. Convenience helper."""
         return StoryResult(name=self.name, passed=True, message=message)
+
+
+# ---------------------------------------------------------------------------
+# ChangeReviewStory — template-method scaffold for review-and-approve stories
+# ---------------------------------------------------------------------------
+
+
+class ChangeReviewStory(AcceptanceStory):
+    """Template-method base class for the *single-round approve* change flow.
+
+    The pattern this captures (shared by s005, s044, s045, and the close
+    cousins s011/s012/s018/s025/s032/s041) is::
+
+        1.  send a chat prompt that asks for a change
+        2.  wait for the change arc to reach 'waiting' with a review_id
+        3.  inspect the diff / arc_state                          [HOOK]
+        4.  submit approval
+        5.  wait for the arc to reach a terminal state
+        6.  assert no failed/cancelled arcs in this session
+        7.  optional post-apply verification                      [HOOK]
+
+    Subclasses customise the story-specific bits via class attributes and
+    overridable hooks; the inherited ``run()`` owns the sequence.
+
+    Multi-round (revise → approve) flows are intentionally NOT supported
+    here — the decision-loop shape varies too much between callers
+    (s007, s023, s035). Those stay imperative.
+
+    Required class attributes
+    -------------------------
+    ``request_text``
+        The user-facing chat prompt sent in step 1.
+    ``ack_keywords``
+        Case-insensitive substrings; the initial assistant response must
+        contain at least one. (Keep this lenient — the agent's wording
+        is non-deterministic.)
+
+    Optional overrides
+    ------------------
+    ``initial_response_timeout``       step-1 pending-clear timeout (s).
+    ``review_wait_timeout``            step-2 poll timeout (s).
+    ``terminal_wait_timeout``          step-5 poll timeout (s).
+    ``approve_comment``                comment string submitted with the
+                                       approval (default ``"Approved."``).
+    ``inspect_diff(diff, arc_state)``  story-specific diff-content
+                                       assertions.
+    ``post_apply(client, db, conv_id, review_arc)``
+                                       optional extra verification after
+                                       the arc completes.
+
+    The hook signatures keep ``client`` and ``db`` available so subclasses
+    can drop into ad-hoc behavioural / DB checks without re-deriving them.
+    """
+
+    #: Chat prompt sent in step 1.
+    request_text: str = ""
+
+    #: Acknowledgement keywords for the initial response. Lenient by default.
+    ack_keywords: tuple[str, ...] = (
+        "coding", "modif", "change", "arc", "implement", "add", "work",
+        "done", "updated", "edit", "kb", "yaml",
+    )
+
+    #: Comment passed with the approval decision.
+    approve_comment: str = "Approved."
+
+    #: Step 1 pending-clear timeout in seconds.
+    initial_response_timeout: int = 90
+
+    #: Step 2 review-arc poll timeout in seconds.
+    review_wait_timeout: int = 300
+
+    #: Step 5 terminal-status poll timeout in seconds.
+    terminal_wait_timeout: int = 120
+
+    # ── Hooks for subclasses ─────────────────────────────────────────────
+
+    def inspect_diff(self, diff: str, arc_state: dict) -> None:
+        """Story-specific diff / arc_state assertions.
+
+        Called after the change arc reaches ``waiting`` and before the
+        approval is submitted. Subclasses use ``self.assert_that`` /
+        ``self.assert_contains`` to check that the diff contains the
+        expected substring(s) or that ``arc_state`` carries the expected
+        metadata (e.g. workflow template name, source dir, changed files).
+
+        Default: asserts that ``diff`` is non-empty. Override to add more
+        specific checks.
+        """
+        self.assert_that(
+            bool(diff),
+            "Diff is empty — change agent produced no changes",
+            arc_state_keys=list(arc_state.keys()),
+        )
+
+    def post_apply(
+        self,
+        client: "CarpenterClient",
+        db: "DBInspector | None",
+        conv_id: int,
+        review_arc: dict,
+    ) -> None:
+        """Optional verification after the arc reaches ``completed``.
+
+        Use for file-existence checks, audit-log assertions, follow-up
+        chat turns, etc. Default: no-op.
+        """
+
+    # ── The owned sequence ───────────────────────────────────────────────
+
+    def run(
+        self, client: "CarpenterClient", db: "DBInspector"
+    ) -> "StoryResult":
+        if not self.request_text:
+            raise RuntimeError(
+                f"{type(self).__name__}: must set class attribute "
+                f"`request_text` to a non-empty prompt."
+            )
+
+        start_ts = time.time()
+        self._start_ts = start_ts  # exposed for hook use
+
+        # ── 1. Send the request ─────────────────────────────────────────
+        print(f"\n  [1/5] Sending change request...")
+        conv_id = client.create_conversation()
+        client.send_message(self.request_text, conv_id)
+        client.wait_for_pending_to_clear(
+            conv_id, timeout=self.initial_response_timeout,
+        )
+
+        msgs = client.get_assistant_messages(conv_id)
+        self.assert_that(
+            len(msgs) >= 1,
+            "No response after change request",
+            conversation_id=conv_id,
+        )
+        init_resp = msgs[-1]["content"]
+        print(f"     {init_resp[:140]}")
+        self.assert_that(
+            any(kw in init_resp.lower() for kw in self.ack_keywords),
+            "Initial response does not acknowledge the change request",
+            response_preview=init_resp[:400],
+            ack_keywords=list(self.ack_keywords),
+        )
+
+        # ── 2. Wait for the review arc ──────────────────────────────────
+        print(
+            f"  [2/5] Waiting for change arc to reach 'waiting' "
+            f"(≤{self.review_wait_timeout}s)..."
+        )
+        review_arc = None
+        if db is not None:
+            review_arc = db.wait_for_pending_review_arc(
+                start_ts, timeout=self.review_wait_timeout,
+            )
+            self.assert_that(
+                review_arc is not None,
+                "Change arc never reached 'waiting' with a review_id",
+                arcs=db.format_arcs_table(
+                    db.get_arcs_created_after(start_ts)
+                ),
+            )
+
+        arc_state = review_arc["arc_state"]
+        review_id = arc_state["review_id"]
+        diff = arc_state.get("diff", "")
+        print(f"     Arc {review_arc['id']} waiting, review_id={review_id}")
+        print(f"     Diff preview: {diff[:240]}")
+
+        # ── 3. Story-specific diff inspection ───────────────────────────
+        print(f"  [3/5] Inspecting diff (story-specific)...")
+        self.inspect_diff(diff, arc_state)
+
+        # ── 4. Approve ──────────────────────────────────────────────────
+        print(f"  [4/5] Approving (review_id={review_id})...")
+        result = client.submit_review_decision(
+            review_id, decision="approve", comment=self.approve_comment,
+        )
+        self.assert_that(
+            result.get("recorded") is True,
+            "Approval was not recorded by the server",
+            server_response=result,
+        )
+
+        # ── 5. Wait for terminal + clean-history check ──────────────────
+        print(
+            f"  [5/5] Waiting for arc {review_arc['id']} to complete "
+            f"(≤{self.terminal_wait_timeout}s)..."
+        )
+        if db is not None:
+            final_arc = db.wait_for_arc_terminal(
+                review_arc["id"], timeout=self.terminal_wait_timeout,
+            )
+            self.assert_that(
+                final_arc is not None
+                and final_arc["status"] == "completed",
+                f"Change arc did not complete "
+                f"(status="
+                f"{final_arc['status'] if final_arc else 'not found'})",
+                arcs=db.format_arcs_table(
+                    db.get_arcs_created_after(start_ts)
+                ),
+            )
+            print(f"     Arc completed ✓")
+            self.assert_no_failed_arcs_since(db, start_ts)
+
+        # ── Post-apply (optional, story-specific) ───────────────────────
+        self.post_apply(client, db, conv_id, review_arc)
+
+        return self.result(
+            f"change arc {review_arc['id']} approved and completed ✓"
+        )

@@ -193,3 +193,267 @@ def test_assert_no_failed_arcs_since_uses_workflow_label() -> None:
 def test_assert_no_failed_arcs_since_noop_when_db_none() -> None:
     story = _DummyStory()
     story.assert_no_failed_arcs_since(None, since_ts=0.0)  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# get_workflow_selected_event_after
+# ---------------------------------------------------------------------------
+
+
+def _make_inspector_with_query(rows_seq: "list[list[dict]]") -> DBInspector:
+    """Inspector whose ``_query`` returns successive elements of rows_seq."""
+    db = DBInspector("/nonexistent")
+    state = {"i": 0}
+
+    def fake(_sql: str, _params: tuple = ()) -> list[dict]:
+        i = state["i"]
+        state["i"] = min(i + 1, len(rows_seq) - 1)
+        return rows_seq[i]
+
+    db._query = fake  # type: ignore[assignment]
+    return db
+
+
+def test_get_workflow_selected_event_after_returns_decoded_details() -> None:
+    db = _make_inspector_with_query([
+        [{"id": 42, "details_json": '{"chosen_template": "yaml-change", '
+                                    '"force_human": false, '
+                                    '"categories": ["yaml"]}'}],
+    ])
+    result = db.get_workflow_selected_event_after(since_ts=0.0)
+    assert result is not None
+    assert result["chosen_template"] == "yaml-change"
+    assert result["force_human"] is False
+    assert result["_id"] == 42
+
+
+def test_get_workflow_selected_event_after_returns_none_when_missing() -> None:
+    db = _make_inspector_with_query([[]])
+    assert db.get_workflow_selected_event_after(since_ts=0.0) is None
+
+
+def test_get_workflow_selected_event_after_handles_empty_json() -> None:
+    """An empty/null details_json should round-trip to ``{}`` (plus _id)."""
+    db = _make_inspector_with_query([[{"id": 9, "details_json": None}]])
+    result = db.get_workflow_selected_event_after(since_ts=0.0)
+    assert result == {"_id": 9}
+
+
+# ---------------------------------------------------------------------------
+# get_verification_arcs_for / get_verification_arc_by_role
+# ---------------------------------------------------------------------------
+
+
+def test_get_verification_arc_by_role_finds_via_step_role() -> None:
+    """Helper finds verifier rows linked by verification_target_id."""
+    db = _make_inspector_with_query([
+        [{"id": 5324, "name": "lint-yaml", "step_role": "lint-yaml",
+          "status": "completed", "step_order": 0,
+          "verification_target_id": 5323}],
+    ])
+    result = db.get_verification_arc_by_role(5323, "lint-yaml")
+    assert result is not None
+    assert result["name"] == "lint-yaml"
+    assert result["status"] == "completed"
+
+
+def test_get_verification_arc_by_role_falls_back_to_name() -> None:
+    """When step_role lookup yields nothing, fall back to name match."""
+    # First call (by step_role) returns empty; second (by name) hits.
+    db = _make_inspector_with_query([
+        [],
+        [{"id": 99, "name": "verify-kb-format", "step_role": None,
+          "status": "completed", "step_order": 0,
+          "verification_target_id": 42}],
+    ])
+    result = db.get_verification_arc_by_role(42, "verify-kb-format")
+    assert result is not None
+    assert result["id"] == 99
+
+
+def test_get_verification_arc_by_role_returns_none_when_missing() -> None:
+    db = _make_inspector_with_query([[], []])
+    assert db.get_verification_arc_by_role(1, "nothing") is None
+
+
+def test_get_verification_arcs_for_returns_ordered_list() -> None:
+    rows = [
+        {"id": 11, "name": "lint-yaml", "step_order": 0,
+         "verification_target_id": 5},
+        {"id": 12, "name": "judge", "step_order": 1,
+         "verification_target_id": 5},
+    ]
+    db = _make_inspector_with_query([rows])
+    result = db.get_verification_arcs_for(5)
+    assert [r["id"] for r in result] == [11, 12]
+
+
+# ---------------------------------------------------------------------------
+# ChangeReviewStory scaffold
+# ---------------------------------------------------------------------------
+
+
+from user_stories.framework import (  # noqa: E402 — imported here so the
+    ChangeReviewStory,                # other tests above don't pay the
+    CarpenterClient,                  # ChangeReviewStory cost when only
+)                                     # the helpers are under test.
+
+
+class _StubClient:
+    """Minimal stand-in for CarpenterClient that the scaffold can call."""
+
+    def __init__(self, init_response: str = "OK, working on the change.") -> None:
+        self._init_response = init_response
+        self.created = 0
+        self.sent: list[tuple[int, str]] = []
+        self.approvals: list[tuple[str, str, str]] = []
+        self.pending_cleared = False
+
+    def create_conversation(self) -> int:
+        self.created += 1
+        return 100 + self.created
+
+    def send_message(self, text: str, conv_id: int) -> None:
+        self.sent.append((conv_id, text))
+
+    def wait_for_pending_to_clear(self, conv_id: int, timeout: int = 60) -> None:
+        self.pending_cleared = True
+
+    def get_assistant_messages(self, conv_id: int) -> list[dict]:
+        return [{"role": "assistant", "content": self._init_response}]
+
+    def submit_review_decision(
+        self, review_id: str, decision: str, comment: str = "",
+    ) -> dict:
+        self.approvals.append((review_id, decision, comment))
+        return {"recorded": True}
+
+
+class _StubDB:
+    """Minimal stand-in for DBInspector covering the scaffold's calls."""
+
+    def __init__(
+        self,
+        review_arc: "dict | None",
+        final_arc: "dict | None",
+        all_arcs: list[dict] | None = None,
+    ) -> None:
+        self._review = review_arc
+        self._final = final_arc
+        self._all = all_arcs or []
+
+    def wait_for_pending_review_arc(self, *_a, **_kw):
+        return self._review
+
+    def wait_for_arc_terminal(self, *_a, **_kw):
+        return self._final
+
+    def get_arc(self, arc_id):
+        return self._final
+
+    def get_arcs_created_after(self, _ts):
+        return self._all
+
+    def format_arcs_table(self, arcs):
+        return f"(table of {len(arcs)} arcs)"
+
+
+class _MinimalScaffoldStory(ChangeReviewStory):
+    """Concrete subclass that records the hooks it ran."""
+
+    name = "test-minimal-scaffold"
+    artifact_prefix = "test"
+    request_text = "Please make a tiny change."
+    ack_keywords = ("change", "working", "ok")
+
+    inspect_calls: list[tuple[str, dict]]
+    post_apply_calls: list[tuple[int, dict]]
+
+    def __init__(self) -> None:
+        self.inspect_calls = []
+        self.post_apply_calls = []
+
+    def inspect_diff(self, diff: str, arc_state: dict) -> None:
+        self.inspect_calls.append((diff, arc_state))
+        super().inspect_diff(diff, arc_state)
+
+    def post_apply(self, client, db, conv_id, review_arc) -> None:
+        self.post_apply_calls.append((conv_id, review_arc))
+
+
+def test_change_review_story_runs_through_happy_path() -> None:
+    review_arc = {
+        "id": 11,
+        "arc_state": {"review_id": "rid-11", "diff": "+ new line\n"},
+    }
+    final_arc = {"id": 11, "status": "completed", "name": "x"}
+    story = _MinimalScaffoldStory()
+    client = _StubClient()
+    db = _StubDB(
+        review_arc=review_arc,
+        final_arc=final_arc,
+        all_arcs=[final_arc],
+    )
+
+    result = story.run(client, db)  # type: ignore[arg-type]
+
+    assert result.passed is True
+    # Prompt was sent once.
+    assert len(client.sent) == 1
+    assert client.sent[0][1] == "Please make a tiny change."
+    # Approval was submitted with the configured comment.
+    assert client.approvals == [("rid-11", "approve", "Approved.")]
+    # Hooks fired exactly once each, with the expected args.
+    assert len(story.inspect_calls) == 1
+    assert story.inspect_calls[0][0] == "+ new line\n"
+    assert len(story.post_apply_calls) == 1
+    assert story.post_apply_calls[0][1] is review_arc
+
+
+def test_change_review_story_rejects_empty_request_text() -> None:
+    class _NoPromptStory(ChangeReviewStory):
+        name = "no-prompt"
+        artifact_prefix = "noprompt"
+        # request_text intentionally left as default ""
+
+    story = _NoPromptStory()
+    client = _StubClient()
+    db = _StubDB(review_arc=None, final_arc=None)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        story.run(client, db)  # type: ignore[arg-type]
+    assert "request_text" in str(exc_info.value)
+
+
+def test_change_review_story_fails_on_missing_ack() -> None:
+    review_arc = {
+        "id": 11,
+        "arc_state": {"review_id": "rid-11", "diff": "+x\n"},
+    }
+    story = _MinimalScaffoldStory()
+    # Client returns a response that has zero overlap with ack_keywords.
+    client = _StubClient(init_response="zzz qqq")
+    db = _StubDB(review_arc=review_arc, final_arc=None)
+
+    with pytest.raises(AssertionFailure) as exc_info:
+        story.run(client, db)  # type: ignore[arg-type]
+    assert "Initial response does not acknowledge" in exc_info.value.message
+
+
+def test_change_review_story_fails_when_arc_does_not_reach_terminal() -> None:
+    review_arc = {
+        "id": 22,
+        "arc_state": {"review_id": "rid-22", "diff": "diff content"},
+    }
+    final_arc = {"id": 22, "status": "running", "name": "stuck"}
+    story = _MinimalScaffoldStory()
+    client = _StubClient()
+    db = _StubDB(
+        review_arc=review_arc,
+        final_arc=final_arc,
+        all_arcs=[final_arc],
+    )
+
+    with pytest.raises(AssertionFailure) as exc_info:
+        story.run(client, db)  # type: ignore[arg-type]
+    assert "did not complete" in exc_info.value.message
