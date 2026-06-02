@@ -23,17 +23,24 @@ DB verification:
   - At least one coding-change arc created.
   - The arc reaches 'waiting' with a diff for review.
   - After approval, the arc completes.
+
+Built on the ``ChangeReviewStory`` scaffold — the request → review →
+approve → terminal sequence lives in the base class. We only customise
+the diff-content assertion and the on-disk cleanup.
 """
 
+from __future__ import annotations
+
 import os
-import time
+from pathlib import Path
 
 from user_stories.framework import (
-    AcceptanceStory,
-    DBInspector,
-    StoryResult,
     CarpenterClient,
+    ChangeReviewStory,
+    DBInspector,
 )
+
+_TOOL_NAME = "celsius_to_fahrenheit"
 
 _BUG_REPORT_PROMPT = (
     "I have a bug in my temperature converter. The Celsius to Fahrenheit "
@@ -48,71 +55,43 @@ _BUG_REPORT_PROMPT = (
     "carpenter_tools/read/celsius_to_fahrenheit.py."
 )
 
-_TOOL_NAME = "celsius_to_fahrenheit"
 
-
-class IterativeBugFix(AcceptanceStory):
+class IterativeBugFix(ChangeReviewStory):
     name = "S022 — Iterative Bug Fix (Ralph Loop)"
     description = (
         "User reports C->F conversion bug for negative numbers; agent iterates "
         "with impl+monitor pattern until all test cases pass; 300s+ timeout."
     )
+    artifact_prefix = "s022"
+
+    # The agent's initial response usually mentions the domain
+    # (temperature/celsius/fahrenheit) or the work it's about to start.
+    ack_keywords = (
+        "celsius", "fahrenheit", "temperature", "convert", "fix",
+        "coding", "implement", "tool", "change", "arc", "add", "work",
+    )
+
+    request_text = _BUG_REPORT_PROMPT
+    approve_comment = "Looks correct. All test cases should pass."
+
+    # Iterative impl+monitor loop can take longer than the default.
+    review_wait_timeout = 300
+    terminal_wait_timeout = 120
 
     def __init__(self) -> None:
         self._source_dir: str | None = None
 
-    def run(self, client: CarpenterClient, db: DBInspector) -> StoryResult:
-        start_ts = time.time()
+    # ── Hooks ────────────────────────────────────────────────────────
 
-        # ── 1. Report the bug ─────────────────────────────────────────────────
-        print("\n  [1/4] Reporting temperature conversion bug...")
-        conv_id = client.create_conversation()
-        client.send_message(_BUG_REPORT_PROMPT, conv_id)
-        client.wait_for_pending_to_clear(conv_id, timeout=90)
+    def inspect_diff(self, diff: str, arc_state: dict) -> None:
+        super().inspect_diff(diff, arc_state)
 
-        msgs = client.get_assistant_messages(conv_id)
-        self.assert_that(
-            len(msgs) >= 1,
-            "No response after bug report",
-            conversation_id=conv_id,
-        )
-        init_resp = msgs[-1]["content"]
-        print(f"     {init_resp[:200]}")
-
-        self.assert_that(
-            any(kw in init_resp.lower() for kw in
-                ("celsius", "fahrenheit", "temperature", "convert", "fix",
-                 "coding", "implement", "tool", "change")),
-            "Response does not acknowledge the temperature conversion task",
-            response_preview=init_resp[:400],
-        )
-
-        # ── 2. Wait for diff review ──────────────────────────────────────────
-        print("  [2/4] Waiting for coding-change diff (up to 5 min)...")
-        review_arc: dict | None = None
-        if db is not None:
-            review_arc = db.wait_for_pending_review_arc(start_ts, timeout=300)
-            self.assert_that(
-                review_arc is not None,
-                "No coding-change arc reached 'waiting' for review",
-                arcs=db.format_arcs_table(db.get_arcs_created_after(start_ts)),
-            )
-
-        arc_state = review_arc["arc_state"]
-        review_id = arc_state["review_id"]
-        diff = arc_state.get("diff", "")
+        # Remember the source dir so cleanup() can find the artifact
+        # regardless of where the platform is rooted.
         source_dir = arc_state.get("source_dir", "")
         if source_dir:
             self._source_dir = source_dir
-        print(f"     Arc {review_arc['id']} waiting. Diff preview: {diff[:200]}")
 
-        self.assert_that(
-            bool(diff),
-            "Diff is empty — coding agent produced no changes",
-            arc_id=review_arc["id"],
-        )
-
-        # Verify the diff contains the formula
         diff_lower = diff.lower()
         self.assert_that(
             any(kw in diff_lower for kw in ("celsius", "fahrenheit", "9/5", "1.8", "32")),
@@ -120,46 +99,17 @@ class IterativeBugFix(AcceptanceStory):
             diff_preview=diff[:600],
         )
 
-        # ── 3. Approve the diff ───────────────────────────────────────────────
-        print("  [3/4] Approving the coding-change diff...")
-        result = client.submit_review_decision(
-            review_id, decision="approve",
-            comment="Looks correct. All test cases should pass."
-        )
-        self.assert_that(
-            result.get("recorded") is True,
-            "Approval not recorded",
-            server_response=result,
-        )
-
-        # Wait for arc to complete
-        if db is not None:
-            print("  [4/4] Waiting for arc to complete (up to 120s)...")
-            arc = db.wait_for_arc_terminal(review_arc["id"], timeout=120)
-            self.assert_that(
-                arc is not None and arc["status"] == "completed",
-                f"Arc did not complete "
-                f"(status={arc['status'] if arc else 'not found'})",
-                arcs=db.format_arcs_table(db.get_arcs_created_after(start_ts)),
-            )
-            print(f"     Arc completed ✓")
-
-        elapsed = time.time() - start_ts
-        return StoryResult(
-            name=self.name,
-            passed=True,
-            message=(
-                f"Bug fix implemented via coding-change ✓, "
-                f"diff contains conversion logic ✓, "
-                f"approved and completed ✓ "
-                f"({elapsed:.0f}s total)"
-            ),
-        )
+    # ── Cleanup ──────────────────────────────────────────────────────
 
     def cleanup(self, client: CarpenterClient, db: "DBInspector | None") -> None:
-        """Remove the celsius_to_fahrenheit tool created during the test."""
-        from pathlib import Path
+        """Remove any celsius_to_fahrenheit artifacts the agent created.
 
+        Glob-based so we catch variants like ``celsius_to_fahrenheit_tool.py``
+        or files dropped in ``tool_backends/`` / ``act/`` in addition to the
+        canonical ``carpenter_tools/read/`` location. Also strips any matching
+        lines from ``carpenter/api/callbacks.py`` in case the agent registered
+        the tool there.
+        """
         root = (
             Path(self._source_dir) if self._source_dir
             else Path(os.environ.get(
@@ -168,10 +118,45 @@ class IterativeBugFix(AcceptanceStory):
             ))
         )
 
-        tool_path = root / "carpenter_tools" / "read" / f"{_TOOL_NAME}.py"
-        if tool_path.exists():
+        # Glob the likely homes for a tool file: read/, act/, tool_backends/,
+        # plus the package-root config_seed/chat_tools/ used by some variants.
+        scan_dirs = (
+            root / "carpenter_tools" / "read",
+            root / "carpenter_tools" / "act",
+            root / "carpenter" / "tool_backends",
+            root / "config_seed" / "chat_tools",
+        )
+        removed: list[Path] = []
+        for d in scan_dirs:
+            if not d.is_dir():
+                continue
+            for pat in (f"{_TOOL_NAME}.py", f"{_TOOL_NAME}_*.py", f"*{_TOOL_NAME}*.py"):
+                for match in d.glob(pat):
+                    try:
+                        match.unlink()
+                        removed.append(match)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"  [cleanup] Could not remove {match}: {exc}")
+        if removed:
+            print(
+                f"  [cleanup] Removed {len(removed)} artifact(s): "
+                f"{[str(p) for p in removed]}"
+            )
+
+        # Strip any references from callbacks.py (some agents register the
+        # tool there in addition to dropping the file).
+        callbacks_path = root / "carpenter" / "api" / "callbacks.py"
+        if callbacks_path.exists():
             try:
-                tool_path.unlink()
-                print(f"  [cleanup] Removed {tool_path}")
-            except Exception as exc:
-                print(f"  [cleanup] Could not remove {tool_path}: {exc}")
+                original = callbacks_path.read_text()
+                filtered = "\n".join(
+                    line for line in original.splitlines()
+                    if _TOOL_NAME not in line
+                )
+                if original.endswith("\n"):
+                    filtered += "\n"
+                if filtered != original:
+                    callbacks_path.write_text(filtered)
+                    print(f"  [cleanup] Removed {_TOOL_NAME} references from callbacks.py")
+            except Exception as exc:  # noqa: BLE001
+                print(f"  [cleanup] Could not clean callbacks.py: {exc}")
