@@ -280,25 +280,75 @@ class KbChangeWorkflow(ChangeReviewStory):
                 print(f"  [cleanup] DB kb_entries cleanup failed: {exc}")
 
         # Revert last commit if it carries our marker.
+        #
+        # SAFETY: refuse the reset if (a) HEAD touches files outside
+        # the s045 KB scratch namespace — that means a real commit got
+        # matched by the marker; or (b) the working tree has dirty
+        # files outside our namespace — `git reset --hard` would
+        # discard those. Better to leave the test commit than to nuke
+        # a developer's work-in-progress.
         try:
             log = subprocess.run(
                 ["git", "log", "--oneline", "-1", "--format=%s%n%b"],
                 cwd=str(self._source_dir),
                 capture_output=True, text=True, timeout=5,
             )
-            if log.returncode == 0 and (
+            if not (log.returncode == 0 and (
                 "s045" in log.stdout.lower()
                 or "kb scratch" in log.stdout.lower()
                 or "acceptance test" in log.stdout.lower()
-            ):
-                subprocess.run(
-                    ["git", "reset", "--hard", "HEAD~1"],
-                    cwd=str(self._source_dir),
-                    capture_output=True, text=True, timeout=10,
-                )
+            )):
+                return
+
+            # All files in HEAD must be under our KB scratch namespace.
+            head_files = subprocess.run(
+                ["git", "diff-tree", "--no-commit-id", "--name-only",
+                 "-r", "HEAD"],
+                cwd=str(self._source_dir),
+                capture_output=True, text=True, timeout=5,
+            )
+            if head_files.returncode != 0:
+                return
+            changed = [
+                p.strip() for p in head_files.stdout.splitlines() if p.strip()
+            ]
+            scope_prefix = _KB_REL_DIR.rstrip("/") + "/"
+            outside_scope = [p for p in changed if not p.startswith(scope_prefix)]
+            if not changed or outside_scope:
                 print(
-                    "  [cleanup] Reverted last commit "
-                    "(contained s045 / kb scratch marker)"
+                    "  [cleanup] Refusing git reset: HEAD touches "
+                    f"{changed!r}, not just files under {scope_prefix!r}"
+                    " — marker likely matched a real commit."
                 )
+                return
+
+            # Working tree must not have uncommitted changes outside
+            # our scope.
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(self._source_dir),
+                capture_output=True, text=True, timeout=5,
+            )
+            other_dirty = [
+                ln for ln in status.stdout.splitlines()
+                if ln.strip() and scope_prefix not in ln
+            ]
+            if other_dirty:
+                print(
+                    "  [cleanup] Refusing git reset: working tree has "
+                    f"{len(other_dirty)} uncommitted change(s) outside "
+                    f"{scope_prefix!r} — would lose work."
+                )
+                return
+
+            subprocess.run(
+                ["git", "reset", "--hard", "HEAD~1"],
+                cwd=str(self._source_dir),
+                capture_output=True, text=True, timeout=10,
+            )
+            print(
+                "  [cleanup] Reverted last commit "
+                "(only touched files under KB scratch namespace)"
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"  [cleanup] git revert check failed: {exc}")

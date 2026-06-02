@@ -271,6 +271,13 @@ class YamlChangeTemplateWorkflow(ChangeReviewStory):
         # If the coding-change pipeline applied the diff via git commit,
         # the most recent commit in the source repo will mention our
         # sentinel. Best-effort revert so the repo is left clean.
+        #
+        # SAFETY: we refuse the reset if (a) HEAD touches files other
+        # than our target — that means a real commit got matched by the
+        # marker, not ours; or (b) the working tree has uncommitted
+        # changes to other files — `git reset --hard` would discard
+        # those. Better to leave the test commit in place than to nuke
+        # a developer's work-in-progress.
         if self._source_dir is None:
             return
         try:
@@ -279,19 +286,59 @@ class YamlChangeTemplateWorkflow(ChangeReviewStory):
                 cwd=str(self._source_dir),
                 capture_output=True, text=True, timeout=5,
             )
-            if log.returncode == 0 and (
+            if not (log.returncode == 0 and (
                 "s044" in log.stdout.lower()
                 or "dark-factory" in log.stdout.lower()
                 or "acceptance test" in log.stdout.lower()
-            ):
-                subprocess.run(
-                    ["git", "reset", "--hard", "HEAD~1"],
-                    cwd=str(self._source_dir),
-                    capture_output=True, text=True, timeout=10,
-                )
+            )):
+                return
+
+            # Check HEAD only modifies our target file.
+            head_files = subprocess.run(
+                ["git", "diff-tree", "--no-commit-id", "--name-only",
+                 "-r", "HEAD"],
+                cwd=str(self._source_dir),
+                capture_output=True, text=True, timeout=5,
+            )
+            if head_files.returncode != 0:
+                return
+            changed = [
+                p.strip() for p in head_files.stdout.splitlines() if p.strip()
+            ]
+            if changed != [_TARGET_REL_PATH]:
                 print(
-                    "  [cleanup] Reverted last commit "
-                    "(contained s044 / dark-factory / acceptance test)"
+                    "  [cleanup] Refusing git reset: HEAD touches "
+                    f"{changed!r}, not just the test target — marker "
+                    "likely matched a real commit."
                 )
+                return
+
+            # Check the working tree has no other dirty files.
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(self._source_dir),
+                capture_output=True, text=True, timeout=5,
+            )
+            other_dirty = [
+                ln for ln in status.stdout.splitlines()
+                if ln.strip() and not ln.endswith(_TARGET_REL_PATH)
+            ]
+            if other_dirty:
+                print(
+                    "  [cleanup] Refusing git reset: working tree has "
+                    f"{len(other_dirty)} uncommitted change(s) to other "
+                    "files — would lose work."
+                )
+                return
+
+            subprocess.run(
+                ["git", "reset", "--hard", "HEAD~1"],
+                cwd=str(self._source_dir),
+                capture_output=True, text=True, timeout=10,
+            )
+            print(
+                "  [cleanup] Reverted last commit "
+                "(only touched the test target file)"
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"  [cleanup] git revert check failed: {exc}")
