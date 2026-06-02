@@ -298,6 +298,120 @@ class AddPlatformToolViaCodingChange(AcceptanceStory):
         """Remove double_string artifacts from platform source."""
         root = Path(self._source_dir) if self._source_dir else Path(__file__).resolve().parents[1]
 
+        # The coding agent edits the *running* server's source tree, which
+        # may live in a separate clone (``platform_server_dir`` in config).
+        # Walk both the runner's source repo AND the live server repo so
+        # cleanup is correct regardless of which clone the daemon uses.
+        cleanup_roots: list[Path] = [root]
+        try:
+            import yaml as _yaml
+            cfg_path = Path.home() / "carpenter" / "config" / "config.yaml"
+            cfg = _yaml.safe_load(cfg_path.read_text()) if cfg_path.exists() else {}
+            server_dir = cfg.get("platform_server_dir")
+            if server_dir:
+                server_path = Path(server_dir).resolve()
+                if server_path != root.resolve() and server_path not in [p.resolve() for p in cleanup_roots]:
+                    cleanup_roots.append(server_path)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [cleanup] Could not resolve platform_server_dir: {exc}")
+
+        # Glob-walk candidate tool homes. The coding agent may drop the tool
+        # file in any of these locations under several name variants
+        # (``double_string.py``, ``double_string_tool.py``,
+        # ``my_double_string.py``).  Bounded to specific symbol + specific
+        # directories so we cannot accidentally delete unrelated files.
+        scan_dirs: list[Path] = []
+        for r in cleanup_roots:
+            scan_dirs.extend([
+                r / "carpenter_tools" / "read",
+                r / "carpenter_tools" / "act",
+                r / "carpenter" / "tool_backends",
+                r / "config_seed" / "chat_tools",
+            ])
+        glob_removed: list[Path] = []
+        for d in scan_dirs:
+            if not d.is_dir():
+                continue
+            for pat in (
+                f"{_TOOL_NAME}.py",
+                f"{_TOOL_NAME}_*.py",
+                f"*{_TOOL_NAME}*.py",
+            ):
+                for match in d.glob(pat):
+                    # Skip files whose names happen to share an unrelated
+                    # substring (defensive — the glob already constrains).
+                    if _TOOL_NAME not in match.name:
+                        continue
+                    try:
+                        match.unlink()
+                        glob_removed.append(match)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"  [cleanup] Could not remove {match}: {exc}")
+        if glob_removed:
+            print(
+                f"  [cleanup] Glob-removed {len(glob_removed)} artifact(s): "
+                f"{[str(p) for p in glob_removed]}"
+            )
+
+        # Strip ``double_string`` references from registry-ish files so a
+        # stale import or registration cannot block a later run.  Cover
+        # both the runner source repo and the live server repo.
+        registry_paths: list[Path] = []
+        for r in cleanup_roots:
+            for registry_rel in (
+                ("carpenter", "api", "callbacks.py"),
+                ("carpenter", "chat_tool_registry.py"),
+            ):
+                registry_paths.append(r.joinpath(*registry_rel))
+        for reg_path in registry_paths:
+            if reg_path.exists():
+                try:
+                    original = reg_path.read_text()
+                    filtered = "\n".join(
+                        line for line in original.splitlines()
+                        if _TOOL_NAME not in line
+                    )
+                    if original.endswith("\n"):
+                        filtered += "\n"
+                    if filtered != original:
+                        reg_path.write_text(filtered)
+                        print(
+                            f"  [cleanup] Removed {_TOOL_NAME} references "
+                            f"from {reg_path}"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  [cleanup] Could not clean {reg_path}: {exc}")
+
+        # If the coding agent edited ``carpenter_tools/{read,act}/__init__.py``
+        # to import the new tool, restoring those files line-by-line is
+        # fragile (may also strip unrelated imports on the same line).
+        # Use ``git checkout`` to restore the file to its tracked state if
+        # the tool name appears in it.  Operate on cleanup_roots so we
+        # fix both runner-source and live-server clones.
+        import subprocess as _subprocess
+        for r in cleanup_roots:
+            for init_rel in (
+                ("carpenter_tools", "read", "__init__.py"),
+                ("carpenter_tools", "act", "__init__.py"),
+            ):
+                init_path = r.joinpath(*init_rel)
+                if not init_path.exists():
+                    continue
+                try:
+                    if _TOOL_NAME in init_path.read_text():
+                        _subprocess.run(
+                            ["git", "checkout", "--", str(init_path.relative_to(r))],
+                            cwd=str(r),
+                            check=False,
+                            capture_output=True,
+                        )
+                        print(
+                            f"  [cleanup] git-restored {init_path} "
+                            f"(contained {_TOOL_NAME})"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  [cleanup] Could not restore {init_path}: {exc}")
+
         # Remove tool YAML entry if it was added to a separate file.
         # The coding agent may use a numeric prefix (e.g. 13-double_string.yaml),
         # so glob for any file matching *double_string*.yaml in config-seed/tools/.
