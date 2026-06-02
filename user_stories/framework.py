@@ -855,14 +855,37 @@ class DBInspector:
     ) -> dict | None:
         """Return the verifier arc with the given ``step_role`` (or name).
 
-        Falls back to matching on ``arcs.name`` when ``step_role`` is
-        unpopulated. Returns the first match by ``step_order``.
+        Story authors pass an unprefixed role like ``"lint-yaml"`` or
+        ``"verify-kb-format"`` (matching the step name in the workflow
+        template). The actual ``arcs.step_role`` value persisted by
+        ``carpenter.core.arcs.verification`` is prefixed with
+        ``"verifier-"`` (e.g. ``"verifier-lint-yaml"``,
+        ``"verifier-kb-format"``, ``"verifier-correctness"``,
+        ``"verifier-quality"``). We match both the raw role and the
+        ``verifier-<role>`` variant so the helper is robust either way
+        — callers shouldn't need to know which convention carpenter-core
+        is using on a given day.
+
+        Falls back to matching on ``arcs.name`` if neither step_role
+        form hits. This is defense-in-depth — current carpenter-core
+        always populates ``step_role`` for verifier arcs, so the
+        fallback should be unreachable in practice; it just keeps the
+        helper from silently breaking if a future verifier arc is
+        constructed without a step_role.
+
+        Returns the first match by ``step_order``.
         """
+        prefixed = (
+            step_role
+            if step_role.startswith("verifier-")
+            else f"verifier-{step_role}"
+        )
         rows = self._query(
             "SELECT * FROM arcs "
-            "WHERE verification_target_id = ? AND step_role = ? "
+            "WHERE verification_target_id = ? "
+            "AND step_role IN (?, ?) "
             "ORDER BY COALESCE(step_order, 0), id LIMIT 1",
-            (implementation_arc_id, step_role),
+            (implementation_arc_id, step_role, prefixed),
         )
         if rows:
             return rows[0]
