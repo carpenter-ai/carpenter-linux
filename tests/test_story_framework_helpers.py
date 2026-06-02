@@ -257,8 +257,62 @@ def test_get_verification_arc_by_role_finds_via_step_role() -> None:
     assert result["status"] == "completed"
 
 
+def test_get_verification_arc_by_role_finds_via_prefixed_step_role() -> None:
+    """Caller passes the raw role; stored step_role is ``verifier-<role>``.
+
+    This is the real shape of data in carpenter-core: ``verify-kb-format``
+    is the step name (and arc name), but
+    ``carpenter/core/arcs/verification.py`` persists ``step_role`` as
+    ``verifier-kb-format``. The first SQL query must hit on the prefixed
+    variant — no name-fallback needed.
+    """
+    db = _make_inspector_with_query([
+        [{"id": 5420, "name": "verify-kb-format",
+          "step_role": "verifier-kb-format",
+          "status": "completed", "step_order": 0,
+          "verification_target_id": 5419}],
+    ])
+    result = db.get_verification_arc_by_role(5419, "verify-kb-format")
+    assert result is not None
+    assert result["id"] == 5420
+    assert result["step_role"] == "verifier-kb-format"
+
+
+def test_get_verification_arc_by_role_accepts_already_prefixed_role() -> None:
+    """If a caller passes the prefixed role, helper still works (no
+    ``verifier-verifier-foo`` double-prefix)."""
+    db = _make_inspector_with_query([
+        [{"id": 7, "name": "lint-yaml", "step_role": "verifier-lint-yaml",
+          "status": "completed", "step_order": 0,
+          "verification_target_id": 6}],
+    ])
+    result = db.get_verification_arc_by_role(6, "verifier-lint-yaml")
+    assert result is not None
+    assert result["id"] == 7
+
+
+def test_get_verification_arc_by_role_step_role_query_uses_both_forms() -> None:
+    """The single step_role query must include both raw and prefixed
+    variants in its parameters — that's the whole point of the fix."""
+    captured: dict[str, Any] = {}
+
+    db = DBInspector("/nonexistent")
+
+    def fake(sql: str, params: tuple = ()) -> list[dict]:
+        captured.setdefault("calls", []).append((sql, params))
+        return []
+
+    db._query = fake  # type: ignore[assignment]
+    db.get_verification_arc_by_role(42, "lint-yaml")
+    first_sql, first_params = captured["calls"][0]
+    assert "step_role IN" in first_sql
+    assert "lint-yaml" in first_params
+    assert "verifier-lint-yaml" in first_params
+
+
 def test_get_verification_arc_by_role_falls_back_to_name() -> None:
-    """When step_role lookup yields nothing, fall back to name match."""
+    """When step_role lookup yields nothing (defense-in-depth for arcs
+    constructed without a step_role), fall back to name match."""
     # First call (by step_role) returns empty; second (by name) hits.
     db = _make_inspector_with_query([
         [],
