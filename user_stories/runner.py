@@ -191,12 +191,17 @@ def discover_stories(prefix_filter: list[str] | None = None) -> list[AcceptanceS
 
         for attr in dir(mod):
             obj = getattr(mod, attr)
-            if (
-                isinstance(obj, type)
-                and issubclass(obj, AcceptanceStory)
-                and obj is not AcceptanceStory
-            ):
-                stories.append(obj())
+            if not (isinstance(obj, type) and issubclass(obj, AcceptanceStory)):
+                continue
+            if obj is AcceptanceStory:
+                continue
+            # Skip framework-defined base/scaffold classes that the
+            # story modules import (e.g. ``ChangeReviewStory``). Those
+            # live in ``user_stories.framework`` and are abstract — they
+            # have a default ``name = "unnamed"`` and no ``request_text``.
+            if getattr(obj, "__module__", "").endswith(".framework"):
+                continue
+            stories.append(obj())
 
     return stories
 
