@@ -709,6 +709,58 @@ class DBInspector:
             "SELECT * FROM arc_history WHERE arc_id = ? ORDER BY id", (arc_id,)
         )
 
+    def wait_for_pending_review_arc(
+        self,
+        since_ts: float,
+        timeout: int = 300,
+        poll_interval: float = 5.0,
+        exclude_review_ids: "set[str] | frozenset[str]" = frozenset(),
+    ) -> dict | None:
+        """Block until a coding-change arc is in 'waiting' state with a review_id.
+
+        Polls ``get_arcs_pending_review(since_ts)`` and returns the first
+        arc whose ``review_id`` is NOT in ``exclude_review_ids`` (use this
+        to skip a review you already handled when waiting for a revised
+        diff). Returns ``None`` on timeout — callers can decide whether
+        that's a failure or not (most call sites assert separately so
+        they can attach their own diagnostics).
+
+        Returned dict has the ``arc_state`` key already populated, matching
+        ``get_arcs_pending_review`` output.
+        """
+        deadline = time.monotonic() + timeout
+        excluded = frozenset(exclude_review_ids)
+        while time.monotonic() < deadline:
+            pending = self.get_arcs_pending_review(since_ts)
+            for arc in pending:
+                rid = arc["arc_state"].get("review_id")
+                if rid not in excluded:
+                    return arc
+            time.sleep(poll_interval)
+        return None
+
+    def wait_for_arc_terminal(
+        self,
+        arc_id: int,
+        timeout: int = 120,
+        poll_interval: float = 3.0,
+    ) -> dict | None:
+        """Block until a single arc reaches a terminal status.
+
+        Returns the arc dict once status is terminal, or the last-seen
+        arc dict on timeout (or ``None`` if the arc never existed).
+        Callers assert against the returned status separately so they
+        can attach their own diagnostics.
+        """
+        deadline = time.monotonic() + timeout
+        last_arc: dict | None = None
+        while time.monotonic() < deadline:
+            last_arc = self.get_arc(arc_id)
+            if last_arc and last_arc["status"] in self.TERMINAL_ARC_STATUSES:
+                return last_arc
+            time.sleep(poll_interval)
+        return last_arc
+
     # --- Message queries ---
 
     def get_messages(self, conversation_id: int) -> list[dict]:
@@ -949,6 +1001,43 @@ class AcceptanceStory:
             substring.lower() in text.lower(),
             msg,
             text_preview=text[:400],
+        )
+
+    def assert_no_failed_arcs_since(
+        self,
+        db: "DBInspector | None",
+        since_ts: float,
+        workflow_label: str = "",
+    ) -> None:
+        """Assert that no arcs created since ``since_ts`` are failed/cancelled.
+
+        Cosmetic helper that replaces the recurring
+        ``bad = [a for a in db.get_arcs_created_after(start_ts)
+                if a["status"] in ("failed", "cancelled")]`` boilerplate.
+        No-op if ``db`` is None.
+
+        Args:
+            db: DBInspector instance (or None — call is then a no-op).
+            since_ts: epoch seconds; only arcs at/after this are checked.
+            workflow_label: optional label prefixed to the failure message
+                (e.g., "Add workflow" or "Remove workflow"). When omitted
+                the message is the generic "{n} arc(s) ended in failed/cancelled".
+        """
+        if db is None:
+            return
+        all_arcs = db.get_arcs_created_after(since_ts)
+        bad = [a for a in all_arcs if a["status"] in ("failed", "cancelled")]
+        if workflow_label:
+            msg = (
+                f"{workflow_label} had {len(bad)} failed/cancelled arc(s) — "
+                f"workflow should complete without a string of failures"
+            )
+        else:
+            msg = f"{len(bad)} arc(s) ended in failed/cancelled"
+        self.assert_that(
+            len(bad) == 0,
+            msg,
+            arcs=db.format_arcs_table(bad),
         )
 
     def result(self, message: str = "") -> "StoryResult":

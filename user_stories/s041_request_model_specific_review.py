@@ -102,16 +102,8 @@ class RequestModelSpecificReview(AcceptanceStory):
         # loop — allow up to 5 minutes.
         print(f"  [2/6] Waiting for coding-change arc to reach 'waiting' (≤5 min)...")
         review_arc = None
-        deadline = time.monotonic() + 300
-        while time.monotonic() < deadline:
-            if db is not None:
-                pending = db.get_arcs_pending_review(start_ts)
-                if pending:
-                    review_arc = pending[0]
-                    break
-            time.sleep(5)
-
         if db is not None:
+            review_arc = db.wait_for_pending_review_arc(start_ts, timeout=300)
             self.assert_that(
                 review_arc is not None,
                 "Coding-change arc never reached 'waiting' with a review_id",
@@ -256,14 +248,7 @@ class RequestModelSpecificReview(AcceptanceStory):
         )
 
         # ── 7. Health check: no failed arcs ──────────────────────────────────
-        if db is not None:
-            all_arcs = db.get_arcs_created_after(start_ts)
-            bad = [a for a in all_arcs if a["status"] in ("failed", "cancelled")]
-            self.assert_that(
-                len(bad) == 0,
-                f"{len(bad)} arc(s) ended in failed/cancelled",
-                arcs=db.format_arcs_table(bad),
-            )
+        self.assert_no_failed_arcs_since(db, start_ts)
 
         return StoryResult(
             name=self.name,
