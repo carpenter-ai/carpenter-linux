@@ -218,14 +218,7 @@ class ChatLanguageConfig(AcceptanceStory):
         )
 
         # Structural: no failed/cancelled arcs from our operations
-        if db is not None:
-            all_arcs = db.get_arcs_created_after(start_ts)
-            bad = [a for a in all_arcs if a["status"] in ("failed", "cancelled")]
-            self.assert_that(
-                len(bad) == 0,
-                f"{len(bad)} arc(s) ended in failed/cancelled",
-                arcs=db.format_arcs_table(bad),
-            )
+        self.assert_no_failed_arcs_since(db, start_ts)
 
         return StoryResult(
             name=self.name,

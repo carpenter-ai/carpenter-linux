@@ -147,18 +147,10 @@ class MultipleReviewsQueued(AcceptanceStory):
         print("  [5/7] Waiting for revised text_stats (up to 5 min)...")
         review_ts2: dict | None = None
         seen_ids = {wf_review_id, ts_review_id}
-        deadline = time.monotonic() + 300
-        while time.monotonic() < deadline:
-            if db is not None:
-                pending = db.get_arcs_pending_review(start_ts)
-                fresh = [p for p in pending
-                         if p["arc_state"]["review_id"] not in seen_ids]
-                if fresh:
-                    review_ts2 = fresh[0]
-                    break
-            time.sleep(5)
-
         if db is not None:
+            review_ts2 = db.wait_for_pending_review_arc(
+                start_ts, timeout=300, exclude_review_ids=seen_ids,
+            )
             self.assert_that(
                 review_ts2 is not None,
                 "No revised text_stats diff appeared",

@@ -129,16 +129,8 @@ class AddReviseAndRemoveActionTool(AcceptanceStory):
         # ── 2. Wait for the first diff review ────────────────────────────────
         print(f"  [2/8] Waiting for first diff review (≤5 min)...")
         review_arc1: dict | None = None
-        deadline = time.monotonic() + 300
-        while time.monotonic() < deadline:
-            if db is not None:
-                pending = db.get_arcs_pending_review(start_ts)
-                if pending:
-                    review_arc1 = pending[0]
-                    break
-            time.sleep(5)
-
         if db is not None:
+            review_arc1 = db.wait_for_pending_review_arc(start_ts, timeout=300)
             self.assert_that(
                 review_arc1 is not None,
                 "Coding-change arc never reached 'waiting' (round 1)",
@@ -183,19 +175,10 @@ class AddReviseAndRemoveActionTool(AcceptanceStory):
         # ── 4. Wait for the revised diff (different review_id) ───────────────
         print(f"  [4/8] Waiting for revised diff (≤5 min)...")
         review_arc2: dict | None = None
-        deadline = time.monotonic() + 300
-        while time.monotonic() < deadline:
-            if db is not None:
-                pending = db.get_arcs_pending_review(start_ts)
-                # Filter out the review we already handled
-                fresh = [p for p in pending
-                         if p["arc_state"]["review_id"] != review_id1]
-                if fresh:
-                    review_arc2 = fresh[0]
-                    break
-            time.sleep(5)
-
         if db is not None:
+            review_arc2 = db.wait_for_pending_review_arc(
+                start_ts, timeout=300, exclude_review_ids={review_id1},
+            )
             self.assert_that(
                 review_arc2 is not None,
                 "No revised diff appeared after revision request (round 2)",
@@ -238,16 +221,7 @@ class AddReviseAndRemoveActionTool(AcceptanceStory):
         # Wait for the add arc to complete
         print(f"  [5/8] Waiting for add arc to complete (≤120s)...")
         if db is not None:
-            deadline = time.monotonic() + 120
-            final_add_arc = None
-            while time.monotonic() < deadline:
-                final_add_arc = db.get_arc(review_arc2["id"])
-                if final_add_arc and final_add_arc["status"] in (
-                    "completed", "failed", "cancelled"
-                ):
-                    break
-                time.sleep(3)
-
+            final_add_arc = db.wait_for_arc_terminal(review_arc2["id"], timeout=120)
             self.assert_that(
                 final_add_arc is not None
                 and final_add_arc["status"] == "completed",
@@ -258,14 +232,8 @@ class AddReviseAndRemoveActionTool(AcceptanceStory):
             print(f"     Add arc completed ✓")
 
             # Health check: no failures in the add workflow
-            add_arcs = db.get_arcs_created_after(start_ts)
-            bad_add = [a for a in add_arcs
-                       if a["status"] in ("failed", "cancelled")]
-            self.assert_that(
-                len(bad_add) == 0,
-                f"Add workflow had {len(bad_add)} failed/cancelled arc(s) — "
-                f"agent should complete this without a string of failures",
-                arcs=db.format_arcs_table(bad_add),
+            self.assert_no_failed_arcs_since(
+                db, start_ts, workflow_label="Add workflow"
             )
 
         # ── 6. Verify write-mode visibility ───────────────────────────────────
@@ -353,16 +321,10 @@ class AddReviseAndRemoveActionTool(AcceptanceStory):
         # Wait for removal diff
         print(f"  [8/8] Waiting for removal diff (≤5 min)...")
         review_arc_rm: dict | None = None
-        deadline = time.monotonic() + 300
-        while time.monotonic() < deadline:
-            if db is not None:
-                pending = db.get_arcs_pending_review(remove_start_ts)
-                if pending:
-                    review_arc_rm = pending[0]
-                    break
-            time.sleep(5)
-
         if db is not None:
+            review_arc_rm = db.wait_for_pending_review_arc(
+                remove_start_ts, timeout=300,
+            )
             self.assert_that(
                 review_arc_rm is not None,
                 "Removal coding-change arc never reached 'waiting'",
@@ -399,16 +361,7 @@ class AddReviseAndRemoveActionTool(AcceptanceStory):
         # Wait for removal arc to complete
         print(f"  [8/8] Waiting for removal arc to complete (≤120s)...")
         if db is not None:
-            deadline = time.monotonic() + 120
-            final_rm_arc = None
-            while time.monotonic() < deadline:
-                final_rm_arc = db.get_arc(review_arc_rm["id"])
-                if final_rm_arc and final_rm_arc["status"] in (
-                    "completed", "failed", "cancelled"
-                ):
-                    break
-                time.sleep(3)
-
+            final_rm_arc = db.wait_for_arc_terminal(review_arc_rm["id"], timeout=120)
             self.assert_that(
                 final_rm_arc is not None
                 and final_rm_arc["status"] == "completed",
@@ -421,14 +374,8 @@ class AddReviseAndRemoveActionTool(AcceptanceStory):
             print(f"     Removal arc completed ✓")
 
             # Health check: no failures in the remove workflow
-            rm_arcs = db.get_arcs_created_after(remove_start_ts)
-            bad_rm = [a for a in rm_arcs
-                      if a["status"] in ("failed", "cancelled")]
-            self.assert_that(
-                len(bad_rm) == 0,
-                f"Remove workflow had {len(bad_rm)} failed/cancelled arc(s) — "
-                f"agent should complete this without a string of failures",
-                arcs=db.format_arcs_table(bad_rm),
+            self.assert_no_failed_arcs_since(
+                db, remove_start_ts, workflow_label="Remove workflow"
             )
 
         # Structural: file is gone

@@ -90,16 +90,8 @@ class IterativeBugFix(AcceptanceStory):
         # ── 2. Wait for diff review ──────────────────────────────────────────
         print("  [2/4] Waiting for coding-change diff (up to 5 min)...")
         review_arc: dict | None = None
-        deadline = time.monotonic() + 300
-        while time.monotonic() < deadline:
-            if db is not None:
-                pending = db.get_arcs_pending_review(start_ts)
-                if pending:
-                    review_arc = pending[0]
-                    break
-            time.sleep(5)
-
         if db is not None:
+            review_arc = db.wait_for_pending_review_arc(start_ts, timeout=300)
             self.assert_that(
                 review_arc is not None,
                 "No coding-change arc reached 'waiting' for review",
@@ -143,13 +135,7 @@ class IterativeBugFix(AcceptanceStory):
         # Wait for arc to complete
         if db is not None:
             print("  [4/4] Waiting for arc to complete (up to 120s)...")
-            deadline = time.monotonic() + 120
-            while time.monotonic() < deadline:
-                arc = db.get_arc(review_arc["id"])
-                if arc and arc["status"] in ("completed", "failed", "cancelled"):
-                    break
-                time.sleep(3)
-
+            arc = db.wait_for_arc_terminal(review_arc["id"], timeout=120)
             self.assert_that(
                 arc is not None and arc["status"] == "completed",
                 f"Arc did not complete "

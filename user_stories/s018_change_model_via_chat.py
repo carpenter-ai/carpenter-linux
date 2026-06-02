@@ -264,14 +264,8 @@ class ChangeModelViaChat(AcceptanceStory):
 
         # ── 7. Arc health check ───────────────────────────────────────────────
         print(f"\n  [7/7] Checking for failed arcs...")
+        self.assert_no_failed_arcs_since(db, start_ts)
         if db is not None:
-            all_arcs = db.get_arcs_created_after(start_ts)
-            bad = [a for a in all_arcs if a["status"] in ("failed", "cancelled")]
-            self.assert_that(
-                len(bad) == 0,
-                f"{len(bad)} arc(s) ended in failed/cancelled",
-                arcs=db.format_arcs_table(bad),
-            )
             print(f"     No failed arcs ✓")
 
         return StoryResult(

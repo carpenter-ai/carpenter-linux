@@ -73,16 +73,8 @@ class VagueRejectionRethink(AcceptanceStory):
         # ── 2. Wait for first diff ────────────────────────────────────────────
         print("  [2/6] Waiting for first diff (up to 5 min)...")
         review_arc1: dict | None = None
-        deadline = time.monotonic() + 300
-        while time.monotonic() < deadline:
-            if db is not None:
-                pending = db.get_arcs_pending_review(start_ts)
-                if pending:
-                    review_arc1 = pending[0]
-                    break
-            time.sleep(5)
-
         if db is not None:
+            review_arc1 = db.wait_for_pending_review_arc(start_ts, timeout=300)
             self.assert_that(
                 review_arc1 is not None,
                 "No coding-change arc reached 'waiting' (round 1)",
@@ -114,18 +106,10 @@ class VagueRejectionRethink(AcceptanceStory):
         # ── 4. Wait for revised diff ─────────────────────────────────────────
         print("  [4/6] Waiting for revised diff (up to 5 min)...")
         review_arc2: dict | None = None
-        deadline = time.monotonic() + 300
-        while time.monotonic() < deadline:
-            if db is not None:
-                pending = db.get_arcs_pending_review(start_ts)
-                fresh = [p for p in pending
-                         if p["arc_state"]["review_id"] != review_id1]
-                if fresh:
-                    review_arc2 = fresh[0]
-                    break
-            time.sleep(5)
-
         if db is not None:
+            review_arc2 = db.wait_for_pending_review_arc(
+                start_ts, timeout=300, exclude_review_ids={review_id1},
+            )
             self.assert_that(
                 review_arc2 is not None,
                 "No revised diff appeared (round 2)",
@@ -167,13 +151,7 @@ class VagueRejectionRethink(AcceptanceStory):
         # ── 6. Wait for completion ────────────────────────────────────────────
         if db is not None:
             print("  [6/6] Waiting for arc to complete (up to 120s)...")
-            deadline = time.monotonic() + 120
-            while time.monotonic() < deadline:
-                arc = db.get_arc(review_arc2["id"])
-                if arc and arc["status"] in ("completed", "failed", "cancelled"):
-                    break
-                time.sleep(3)
-
+            arc = db.wait_for_arc_terminal(review_arc2["id"], timeout=120)
             self.assert_that(
                 arc is not None and arc["status"] == "completed",
                 f"Arc did not complete "

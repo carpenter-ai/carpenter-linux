@@ -95,16 +95,8 @@ class AddPlatformToolViaCodingChange(AcceptanceStory):
         # loop — allow up to 5 minutes on the Pi.
         print(f"  [2/5] Waiting for coding-change arc to reach 'waiting' (≤5 min)...")
         review_arc = None
-        deadline = time.monotonic() + 300
-        while time.monotonic() < deadline:
-            if db is not None:
-                pending = db.get_arcs_pending_review(start_ts)
-                if pending:
-                    review_arc = pending[0]
-                    break
-            time.sleep(5)
-
         if db is not None:
+            review_arc = db.wait_for_pending_review_arc(start_ts, timeout=300)
             self.assert_that(
                 review_arc is not None,
                 "Coding-change arc never reached 'waiting' with a review_id",
@@ -147,14 +139,7 @@ class AddPlatformToolViaCodingChange(AcceptanceStory):
         # ── 5. Wait for the arc to complete (patch is being applied) ─────────
         print(f"  [5/5] Waiting for arc {review_arc['id']} to complete (≤120s)...")
         if db is not None:
-            deadline = time.monotonic() + 120
-            final_arc = None
-            while time.monotonic() < deadline:
-                final_arc = db.get_arc(review_arc["id"])
-                if final_arc and final_arc["status"] in ("completed", "failed", "cancelled"):
-                    break
-                time.sleep(3)
-
+            final_arc = db.wait_for_arc_terminal(review_arc["id"], timeout=120)
             self.assert_that(
                 final_arc is not None and final_arc["status"] == "completed",
                 f"Coding-change arc did not complete "
@@ -164,13 +149,7 @@ class AddPlatformToolViaCodingChange(AcceptanceStory):
             print(f"     Arc completed ✓")
 
             # No child arc should be in a failed/cancelled state
-            all_arcs = db.get_arcs_created_after(start_ts)
-            bad = [a for a in all_arcs if a["status"] in ("failed", "cancelled")]
-            self.assert_that(
-                len(bad) == 0,
-                f"{len(bad)} arc(s) ended in failed/cancelled",
-                arcs=db.format_arcs_table(bad),
-            )
+            self.assert_no_failed_arcs_since(db, start_ts)
 
         # ── 6. Use the new tool ───────────────────────────────────────────────
         # The coding-change patches config_seed/chat_tools/ in the source repo,
