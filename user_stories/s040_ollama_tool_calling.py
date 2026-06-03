@@ -247,10 +247,14 @@ class OllamaToolCalling(AcceptanceStory):
 
     @staticmethod
     def _locate_config_yaml():
-        for cand in (
-            Path.home() / "carpenter" / "config" / "config.yaml",
-            Path("/home/pi/carpenter/config/config.yaml"),
-        ):
+        # Honour CARPENTER_CONFIG override first; fall back to the
+        # home-relative default.  No install-specific paths.
+        env_override = os.environ.get("CARPENTER_CONFIG", "").strip()
+        candidates: list[Path] = []
+        if env_override:
+            candidates.append(Path(env_override))
+        candidates.append(Path.home() / "carpenter" / "config" / "config.yaml")
+        for cand in candidates:
             if cand.is_file():
                 return cand
         return None

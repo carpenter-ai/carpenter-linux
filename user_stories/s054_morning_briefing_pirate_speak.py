@@ -57,7 +57,10 @@ from user_stories.framework import (
 # generous window.
 _WAIT_FOR_DELIVERY_SECONDS = 240
 
-_ANTHROPIC_MODEL = "claude-haiku-4-5"
+# Oracle model for the semantic pirate / briefing checks.  Set
+# CARPENTER_TEST_ORACLE_MODEL=<anthropic-model-id> to enable; when unset
+# the AI classifier is skipped and the keyword heuristic is used instead.
+_ANTHROPIC_MODEL = os.environ.get("CARPENTER_TEST_ORACLE_MODEL", "")
 _ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 _ANTHROPIC_VERSION = "2023-06-01"
 
@@ -112,6 +115,8 @@ def _load_anthropic_key() -> str | None:
 
 def _ai_classify_yes_no(question: str, text: str) -> tuple[bool | None, str]:
     """Ask Claude Haiku a YES/NO question about *text*."""
+    if not _ANTHROPIC_MODEL:
+        return None, "CARPENTER_TEST_ORACLE_MODEL not set"
     api_key = _load_anthropic_key()
     if not api_key:
         return None, "no ANTHROPIC_API_KEY available"

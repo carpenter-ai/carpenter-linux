@@ -111,6 +111,22 @@ class DockerInstallOnPi(AcceptanceStory):
     def run(self, client: CarpenterClient, db: DBInspector) -> StoryResult:
         start_ts = time.time()
 
+        # ── 0. Resolve test models from env (no hardcoded IDs) ──────────
+        # Set CARPENTER_TEST_MODEL_PRIMARY (and optionally _SECONDARY) to
+        # run; SKIPs cleanly when unset.  PRIMARY is used for all coding
+        # and role models in the generated config.yaml.
+        primary_model = os.environ.get(
+            "CARPENTER_TEST_MODEL_PRIMARY", "",
+        ).strip()
+        if not primary_model:
+            import pytest
+            pytest.skip(
+                "Set CARPENTER_TEST_MODEL_PRIMARY (the model ID the "
+                "containerised carpenter should use for chat and coding) "
+                "to run this story."
+            )
+        self._primary_model = primary_model
+
         # ── 1. Prerequisites ────────────────────────────────────────────
         docker_bin = shutil.which("docker")
         if not docker_bin:
@@ -172,20 +188,20 @@ default_coding_agent: builtin
 coding_agents:
   builtin:
     type: builtin
-    model: claude-haiku-4-5
+    model: {primary_model}
     max_tokens: 4096
     max_iterations: 20
     timeout: 300
 
 model_roles:
-  default: claude-haiku-4-5
-  chat: anthropic:claude-haiku-4-5
-  default_step: claude-haiku-4-5
-  title: claude-haiku-4-5
-  summary: claude-haiku-4-5
-  compaction: claude-haiku-4-5
-  code_review: claude-haiku-4-5
-  review_judge: claude-haiku-4-5
+  default: {primary_model}
+  chat: anthropic:{primary_model}
+  default_step: {primary_model}
+  title: {primary_model}
+  summary: {primary_model}
+  compaction: {primary_model}
+  code_review: {primary_model}
+  review_judge: {primary_model}
 
 review_auto_approve_threshold: 0
 

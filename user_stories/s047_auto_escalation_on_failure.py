@@ -43,8 +43,11 @@ _CONFIG_PATH = Path(os.environ.get(
     Path.home() / "carpenter" / "config" / "config.yaml"
 ))
 
-_HAIKU = "claude-haiku-4-5"
-_SONNET = "claude-sonnet-4-6"
+# Escalation pair (base -> stronger).  Set CARPENTER_TEST_MODEL_PRIMARY
+# (base) and CARPENTER_TEST_MODEL_SECONDARY (escalation target) to run;
+# SKIPs cleanly when either is unset.
+_HAIKU = os.environ.get("CARPENTER_TEST_MODEL_PRIMARY", "")
+_SONNET = os.environ.get("CARPENTER_TEST_MODEL_SECONDARY", "")
 
 _ESCALATION_PROMPT = (
     "Create a single arc with the following goal: "
@@ -77,6 +80,14 @@ class AutoEscalationOnFailure(AcceptanceStory):
 
     def run(self, client: CarpenterClient, db: DBInspector) -> StoryResult:
         start_ts = time.time()
+
+        if not _HAIKU or not _SONNET:
+            import pytest
+            pytest.skip(
+                "Set CARPENTER_TEST_MODEL_PRIMARY (base) and "
+                "CARPENTER_TEST_MODEL_SECONDARY (escalation target) to "
+                "run this story."
+            )
 
         # ── 0. Save original config and add escalation stacks ──────────────
         if _HAS_YAML and _CONFIG_PATH.exists():

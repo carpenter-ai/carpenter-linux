@@ -47,9 +47,10 @@ _CONFIG_PATH = Path(os.environ.get(
     Path.home() / "carpenter" / "config" / "config.yaml"
 ))
 
-# Two models to switch between — both Anthropic, both cheap enough for testing.
-_MODEL_A = "claude-haiku-4-5"
-_MODEL_B = "claude-sonnet-4-6"
+# Two models to switch between.  Set CARPENTER_TEST_MODEL_PRIMARY and
+# CARPENTER_TEST_MODEL_SECONDARY to run; SKIPs cleanly when either is unset.
+_MODEL_A = os.environ.get("CARPENTER_TEST_MODEL_PRIMARY", "")
+_MODEL_B = os.environ.get("CARPENTER_TEST_MODEL_SECONDARY", "")
 
 _CHANGE_PROMPT = (
     "Please change the chat model to `{target}`. "
@@ -114,10 +115,20 @@ class ChangeModelViaChat(AcceptanceStory):
     def run(self, client: CarpenterClient, db: DBInspector) -> StoryResult:
         start_ts = time.time()
 
+        if not _MODEL_A or not _MODEL_B:
+            import pytest
+            pytest.skip(
+                "Set CARPENTER_TEST_MODEL_PRIMARY and "
+                "CARPENTER_TEST_MODEL_SECONDARY (two distinct model IDs) "
+                "to run this story."
+            )
+
         # ── 0. Determine current and target models ────────────────────────────
         self._original_model = self._read_current_chat_model()
-        # Pick a target that's different from what's currently configured
-        if "haiku" in self._original_model.lower():
+        # Pick a target that's different from what's currently configured.
+        # Compare against the configured PRIMARY; if the current model
+        # matches PRIMARY, switch to SECONDARY, otherwise switch to PRIMARY.
+        if self._original_model and _MODEL_A in self._original_model:
             target_model = _MODEL_B
         else:
             target_model = _MODEL_A
