@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Linux platform package for Carpenter AI Agent Platform"
 requires-python = ">=3.11"
 dependencies = [
-    "carpenter-ai @ git+https://rainbow-forge.duckdns.org:3000/ben-harack/carpenter-core.git",
+    "carpenter-ai @ git+https://github.com/carpenter-ai/carpenter-core.git",
 ]
 
 [tool.setuptools.packages.find]
