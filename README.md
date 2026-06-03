@@ -1,6 +1,6 @@
 # Carpenter for Linux
 
-Linux platform package for the [Carpenter](https://rainbow-forge.duckdns.org:3000/ben-harack/carpenter-core) AI agent platform.
+Linux platform package for the [Carpenter](https://github.com/carpenter-ai/carpenter-core) AI agent platform.
 
 ## What This Provides
 
