@@ -95,7 +95,6 @@ from user_stories.framework import (
 
 _PACKAGES_DIR_CANDIDATES = (
     os.environ.get("CARPENTER_PACKAGES_DIR", ""),
-    "/home/pi/repos/carpenter-packages/packages",
     str(Path.home() / "repos" / "carpenter-packages" / "packages"),
 )
 
@@ -292,11 +291,14 @@ class EmailInboundPollTriage(AcceptanceStory):
         _ = time.time()
 
         pkg_dir = _find_email_package()
-        self.assert_that(
-            pkg_dir is not None,
-            "carpenter-gmail package source not found.  Checked: "
-            + ", ".join(c for c in _PACKAGES_DIR_CANDIDATES if c),
-        )
+        if pkg_dir is None:
+            import pytest
+            pytest.skip(
+                "carpenter-gmail package source not found.  "
+                "Set CARPENTER_PACKAGES_DIR or check out the package at "
+                "~/repos/carpenter-packages/packages.  Checked: "
+                + ", ".join(c for c in _PACKAGES_DIR_CANDIDATES if c)
+            )
 
         # Manifest version pinning + triage-asset declaration checks
         # are owned by the package's own ``::manifest_shape`` story —

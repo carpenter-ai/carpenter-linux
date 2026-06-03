@@ -110,7 +110,6 @@ from user_stories.framework import (
 # would load at install time.
 _PACKAGES_DIR_CANDIDATES = (
     os.environ.get("CARPENTER_PACKAGES_DIR", ""),
-    "/home/pi/repos/carpenter-packages/packages",
     str(Path.home() / "repos" / "carpenter-packages" / "packages"),
 )
 
@@ -503,11 +502,14 @@ class EmailArchiveAndDraft(AcceptanceStory):
         _ = time.time()  # not used; cleanup is id-driven
 
         pkg_dir = _find_email_package()
-        self.assert_that(
-            pkg_dir is not None,
-            "carpenter-gmail package source not found.  Checked: "
-            + ", ".join(c for c in _PACKAGES_DIR_CANDIDATES if c),
-        )
+        if pkg_dir is None:
+            import pytest
+            pytest.skip(
+                "carpenter-gmail package source not found.  "
+                "Set CARPENTER_PACKAGES_DIR or check out the package at "
+                "~/repos/carpenter-packages/packages.  Checked: "
+                + ", ".join(c for c in _PACKAGES_DIR_CANDIDATES if c)
+            )
 
         # Load the package's chat-tool entrypoints via the same loader
         # the platform uses at install time.  We do NOT re-assert the

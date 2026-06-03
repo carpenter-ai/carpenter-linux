@@ -42,7 +42,10 @@ from user_stories.framework import (
 # cron has been created.  "* * * * *" fires within ~60 s.
 _WAIT_FOR_DELIVERY_SECONDS = 180
 
-_ANTHROPIC_MODEL = "claude-haiku-4-5"
+# Oracle model for the semantic briefing check.  Set
+# CARPENTER_TEST_ORACLE_MODEL=<anthropic-model-id> to enable; when unset
+# the AI classifier is skipped and the keyword heuristic is used instead.
+_ANTHROPIC_MODEL = os.environ.get("CARPENTER_TEST_ORACLE_MODEL", "")
 _ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 _ANTHROPIC_VERSION = "2023-06-01"
 
@@ -77,6 +80,8 @@ def _ai_classify_yes_no(question: str, text: str) -> tuple[bool | None, str]:
     Returns ``(True, raw)`` for YES, ``(False, raw)`` for NO,
     ``(None, reason)`` if the call failed or the answer was unparseable.
     """
+    if not _ANTHROPIC_MODEL:
+        return None, "CARPENTER_TEST_ORACLE_MODEL not set"
     api_key = _load_anthropic_key()
     if not api_key:
         return None, "no ANTHROPIC_API_KEY available"
