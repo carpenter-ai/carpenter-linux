@@ -204,6 +204,11 @@ def main():
         core_main()
         return
 
+    # packages upgrade — the Linux-platform reconcile/upgrade CLI.
+    if len(sys.argv) > 1 and sys.argv[1] == "packages":
+        from carpenter_linux.packages.upgrade_cli import cmd_packages
+        sys.exit(cmd_packages(sys.argv[2:]))
+
     # Inject Linux platform
     from carpenter.platform import set_platform
     from carpenter_linux.platform import LinuxPlatform
