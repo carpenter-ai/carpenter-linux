@@ -194,16 +194,27 @@ def _reset_reflection_watermark(db_path: str) -> None:
 
 
 def _emit_daily_tick(db_path: str) -> None:
-    """Enqueue a ``reflection.daily_tick`` work item for the daemon."""
-    payload = json.dumps({"source": "s059-acceptance-story"})
+    """Enqueue a ``reflection.daily_tick`` work item for the daemon.
+
+    Mirrors what the built-in ``_builtin.timer_forward`` subscription
+    produces when the cron trigger fires: a work_queue row whose
+    handler is ``handle_reflection_tick`` (registered in
+    ``config_seed/templates/reflection/__init__.py``). Inserting into
+    ``events`` instead does nothing here — no subscription watches for
+    raw ``reflection.daily_tick`` events; only cron-produced
+    ``timer.fired`` events are translated into work items.
+    """
+    payload = json.dumps({
+        "cron_name": "s059-acceptance-story",
+        "fire_time": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+    })
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
-            "INSERT INTO events "
-            "(event_type, payload_json, source, processed, priority, "
-            "idempotency_key) VALUES "
-            "('reflection.daily_tick', ?, 'story:s059', 0, 0, ?)",
-            (payload, f"s059-tick-{int(time.time())}"),
+            "INSERT INTO work_queue "
+            "(event_type, payload_json, status, idempotency_key) VALUES "
+            "('reflection.daily_tick', ?, 'pending', ?)",
+            (payload, f"story:s059-tick-{int(time.time())}"),
         )
         conn.commit()
     finally:
@@ -503,6 +514,10 @@ class ReflectionPrefersEdit(AcceptanceStory):
             # next real tick.
             conn.execute(
                 "DELETE FROM events WHERE source = 'story:s059'",
+            )
+            conn.execute(
+                "DELETE FROM work_queue "
+                "WHERE idempotency_key LIKE 'story:s059-tick-%'",
             )
 
             conn.commit()
