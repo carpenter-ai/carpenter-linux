@@ -156,11 +156,13 @@ def _insert_synthetic_root_arc(db_path: str) -> int:
     try:
         cur = conn.execute(
             "INSERT INTO arcs "
-            "(name, goal, status, priority, integrity_level, agent_type) "
-            "VALUES (?, ?, 'completed', 100, 'trusted', 'EXECUTOR')",
+            "(name, goal, status, priority, integrity_level, agent_type, "
+            "updated_at) "
+            "VALUES (?, ?, 'completed', 100, 'trusted', 'EXECUTOR', ?)",
             (
                 "s059-synthetic-goal",
                 f"Synthetic subject arc for s059 ({int(time.time())})",
+                datetime.now(timezone.utc).isoformat(),
             ),
         )
         conn.commit()
