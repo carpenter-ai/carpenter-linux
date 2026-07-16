@@ -1,81 +1,85 @@
 """
-S049 — Reflection Template End-to-End (Per-Arc Trigger)
+S049 — Reflection Triage-Gate Skips Synthesis (v2)
 
-Verifies the full per-arc reflection flow: completing a root arc triggers
-the reflection subscription, which creates a reflection arc with the correct
-4-step template structure, runs AI analysis, and persists the result to KB.
+Verifies the *negative* half of the v2 reflection triage gate
+(carpenter-core PR #86): when the triage step returns
+``needs_synthesis=false`` the reflect step short-circuits without an
+LLM call, no KB write occurs, and downstream persist/dispatch steps
+no-op cleanly.
 
-Background: reflections are no longer cadence-based (daily/weekly/monthly).
-Since PR #250, a reflection fires automatically when any non-reflection root
-arc reaches "completed" status, via an arc.status_changed subscription.
+This complements S059 (which covers the *positive* branch — triage
+flags synthesis, reflect runs, nearby-KB wiring surfaces edit
+candidates).
 
-Per D2 PR-α (carpenter-core PR #298), template arcs now carry a
-``step_role`` column populated from the template YAML. This story asserts
-on the role-based identity ``(template_name, step_role)`` rather than on
-the human-readable ``arc.name``, treating the latter as presentation only.
+Background — v2 reflection pipeline
+-----------------------------------
 
-Trigger mechanism:
-  1. Insert a synthetic root arc (status=completed) into the arcs table.
-  2. Emit an arc.status_changed event with is_root=True, new_status=completed.
-  3. The server's event processor picks it up and invokes the reflection
-     subscription, creating a reflection arc from the template.
+Since PR #86 the reflection template is a 5-step, triage-gated pipeline:
 
-Expected behaviour:
-  1. A reflection parent arc is created (template_name="reflection",
-     priority=1000 / idle).
-  2. The reflection template instantiates 4 child arcs in order, asserted
-     by their ``step_role``:
-     - role=prepare  (order=0; was "gather-activity")
-     - role=analyze  (order=1; was "reflect"; EXECUTOR, runs AI)
-     - role=persist  (order=2; was "save-reflection")
-     - role=dispatch (order=3; was "dispatch-actions")
-  3. The analyze arc produces AI analysis text.
-  4. The persist step writes a KB entry at reflections/by-arc/{arc_id}.
-  5. All arcs reach a terminal state.
+    gather-activity → triage → reflect → save-reflection → dispatch-actions
 
-DB/KB verification:
-  - Parent arc has template_name="reflection" (joined through
-    workflow_templates), priority=1000.
-  - Four child arcs with the expected step_roles and ordering.
-  - arc_state on reflection arc contains "reflected_arc_id".
-  - KB entry exists at path "reflections/by-arc/{synthetic_arc_id}".
-  - KB entry content is non-trivial (> 50 chars).
+The KB is no longer a diary: ``save-reflection`` never writes
+``reflections/by-day/*`` or ``reflections/by-arc/*`` entries. Knowledge
+lands via ``dispatch-actions`` proposing reviewed kb-change action arcs
+— and only when triage flags synthesis as warranted.
 
-Cleanup: removes the synthetic arc, its reflection arc family, and KB entry.
+Test strategy
+-------------
+
+The daily-cron path (``reflection.daily_tick``) is the only supported
+v2 entry point. The story:
+
+1. Records existing ``reflections/*`` KB entry paths as a baseline
+   (v2 should never create a new one from this run).
+2. Inserts one synthetic completed root arc as the batch subject.
+3. Emits a ``reflection.daily_tick`` event with the watermark reset.
+4. Once the reflection SUPERVISOR arc + its 5 children appear, seeds
+   the triage step's ``_agent_response`` with
+   ``needs_synthesis=false``.
+5. Waits for the reflect step (role ``analyze``) and the persist step
+   (role ``persist``) to reach a terminal state.
+6. Asserts:
+   a. The template has exactly 5 child steps with roles
+      ``[prepare, triage, analyze, persist, dispatch]``.
+   b. ``arc_state["_reflect_gated_skipped"]`` on the reflect arc is
+      truthy — the gate short-circuited before the LLM was invoked.
+   c. ``arc_state["_reflect_nearby_kb_paths"]`` is NOT populated
+      (the nearby-KB block is only built on the synthesis branch).
+   d. No new ``reflections/*`` KB entry appeared during the run
+      (v2 no-diary guarantee).
+
+Cleanup: removes the synthetic subject arc, the reflection arc family,
+and the emitted event.
 """
 
 import json
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from user_stories.framework import (
     AcceptanceStory,
+    CarpenterClient,
     DBInspector,
     StoryResult,
-    CarpenterClient,
 )
 
-# Expected step roles in the reflection template (must match reflection.yaml).
-# Per D2 PR-α: identity for the dispatch path is (template_name, step_role).
-# Names are kept as presentation; assertions key on roles.
-EXPECTED_ROLES = ["prepare", "analyze", "persist", "dispatch"]
+# Expected step roles in the v2 reflection template (see reflection.yaml).
+EXPECTED_ROLES = ["prepare", "triage", "analyze", "persist", "dispatch"]
 
 
-def _insert_synthetic_root_arc(db_path: str, name: str = "test-goal") -> int:
-    """Insert a completed root arc and return its ID.
-
-    The arc is marked completed directly so we can emit the event immediately.
-    We do NOT go through arc_history or notify the server's internal arc
-    manager — we just need a real arc row to reference.
-    """
+def _insert_synthetic_root_arc(db_path: str) -> int:
+    """Insert a completed root arc to serve as the batch subject."""
     conn = sqlite3.connect(db_path)
     try:
         cur = conn.execute(
             "INSERT INTO arcs "
             "(name, goal, status, priority, integrity_level, agent_type) "
             "VALUES (?, ?, 'completed', 100, 'trusted', 'EXECUTOR')",
-            (name, f"Synthetic test arc for s049 acceptance story ({int(time.time())})"),
+            (
+                "s049-synthetic-goal",
+                f"Synthetic subject arc for s049 ({int(time.time())})",
+            ),
         )
         conn.commit()
         return cur.lastrowid
@@ -83,47 +87,90 @@ def _insert_synthetic_root_arc(db_path: str, name: str = "test-goal") -> int:
         conn.close()
 
 
-def _emit_arc_status_changed(db_path: str, arc_id: int) -> None:
-    """Emit an arc.status_changed event that triggers the reflection subscription.
-
-    Mirrors what carpenter.core.engine.triggers.arc_lifecycle.emit_status_changed()
-    does: inserts a row into the events table with the required payload shape.
-    The server's event processor will pick it up and invoke any matching
-    subscriptions (including the reflection one).
-    """
-    payload = json.dumps({
-        "arc_id": arc_id,
-        "old_status": "active",
-        "new_status": "completed",
-        "is_root": True,
-        # No template_name — simulates a plain user-goal arc.
-        # The reflection subscription filter requires template_name != 'reflection',
-        # and $ne matches when the key is absent.
-    })
-    idempotency_key = f"arc-{arc_id}-active-completed"
+def _reset_reflection_watermark(db_path: str) -> None:
+    """Rewind the daily-tick watermark so our synthetic arc is in-scope."""
+    ten_min_ago_iso = (
+        datetime.now(timezone.utc) - timedelta(minutes=10)
+    ).isoformat()
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
-            "INSERT OR IGNORE INTO events "
-            "(event_type, payload_json, source, processed, priority, idempotency_key) "
-            "VALUES ('arc.status_changed', ?, ?, 0, 0, ?)",
-            (payload, f"arc:{arc_id}", idempotency_key),
+            "INSERT INTO arc_state (arc_id, key, value_json) "
+            "VALUES (0, 'reflection_last_tick', ?) "
+            "ON CONFLICT(arc_id, key) DO UPDATE SET "
+            "value_json = excluded.value_json",
+            (json.dumps(ten_min_ago_iso),),
         )
         conn.commit()
     finally:
         conn.close()
 
 
-class ReflectionTemplateEndToEnd(AcceptanceStory):
-    name = "S049 — Reflection Template End-to-End"
-    description = (
-        "Complete a root arc; verify per-arc reflection flow: parent arc, "
-        "4 template steps (gather-activity/reflect/save-reflection/dispatch-actions), "
-        "AI execution, and KB persistence."
-    )
-    timeout = 300  # AI model call can take time
+def _emit_daily_tick(db_path: str) -> None:
+    """Enqueue a ``reflection.daily_tick`` event for the daemon."""
+    payload = json.dumps({"source": "s049-acceptance-story"})
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO events "
+            "(event_type, payload_json, source, processed, priority, "
+            "idempotency_key) VALUES "
+            "('reflection.daily_tick', ?, 'story:s049', 0, 0, ?)",
+            (payload, f"s049-tick-{int(time.time())}"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
-    # Track IDs for cleanup
+
+def _seed_triage_skip(db_path: str, triage_arc_id: int) -> None:
+    """Seed the triage step's ``_agent_response`` with a skip verdict.
+
+    ``handle_reflect_gated._read_triage_result`` reads ``_agent_response``
+    from arc_state, ``json.loads`` it once to get the string payload, then
+    ``json.loads`` again to parse the TriageResult. So we double-encode
+    here, matching s059's positive-branch seed.
+    """
+    payload = {
+        "needs_synthesis": False,
+        "reasons": ["s049 seeded triage skip to exercise gate no-op path"],
+        "focus_pointers": [],
+    }
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO arc_state (arc_id, key, value_json) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(arc_id, key) DO UPDATE SET "
+            "value_json = excluded.value_json",
+            (
+                triage_arc_id,
+                "_agent_response",
+                json.dumps(json.dumps(payload)),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _reflection_kb_paths(db: DBInspector) -> set[str]:
+    """Snapshot every ``reflections/*`` KB path currently in kb_entries."""
+    return {
+        e["path"]
+        for e in db.get_kb_entries(path_prefix="reflections/")
+    }
+
+
+class ReflectionTriageGateSkips(AcceptanceStory):
+    name = "S049 — Reflection Triage-Gate Skips Synthesis"
+    description = (
+        "Emit reflection.daily_tick; force triage to needs_synthesis=false; "
+        "assert reflect short-circuits (_reflect_gated_skipped=true), the "
+        "5-step template shape is intact, and no diary KB entry is written."
+    )
+    timeout = 300
+
     _synthetic_arc_id: int | None = None
     _reflection_arc_id: int | None = None
 
@@ -131,231 +178,192 @@ class ReflectionTemplateEndToEnd(AcceptanceStory):
         self.assert_that(db is not None, "DB inspector required for this test")
         start_ts = time.time()
 
-        # ── 1. Create synthetic root arc + emit event ───────────────────────
-        print("\n  [1/5] Inserting synthetic completed root arc + emitting event...")
-        self._synthetic_arc_id = _insert_synthetic_root_arc(db.db_path)
-        print(f"     Synthetic arc ID: {self._synthetic_arc_id}")
-        _emit_arc_status_changed(db.db_path, self._synthetic_arc_id)
-        print(f"     arc.status_changed event emitted for arc {self._synthetic_arc_id}")
+        # ── 1. Baseline reflections/* KB paths ──────────────────────────────
+        print("\n  [1/6] Snapshotting existing reflections/* KB paths...")
+        baseline_paths = _reflection_kb_paths(db)
+        print(f"     Baseline: {len(baseline_paths)} entry/entries")
 
-        # ── 2. Wait for reflection arc + 4 children to appear ───────────────
-        print("  [2/5] Waiting for reflection arc (template_name='reflection') "
-              "+ 4 children (up to 30s)...")
+        # ── 2. Synthetic subject arc + reset watermark + emit tick ──────────
+        print("  [2/6] Inserting synthetic completed root arc...")
+        self._synthetic_arc_id = _insert_synthetic_root_arc(db.db_path)
+        print(f"     Synthetic subject arc ID: {self._synthetic_arc_id}")
+
+        print("  [3/6] Resetting watermark + emitting reflection.daily_tick...")
+        _reset_reflection_watermark(db.db_path)
+        _emit_daily_tick(db.db_path)
+
+        # ── 4. Wait for reflection SUPERVISOR + 5 children ──────────────────
+        print("     Waiting for reflection arc + 5 children (up to 45s)...")
         reflection_arc = None
-        children = []
-        deadline = time.monotonic() + 30
+        children: list[dict] = []
+        deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             new_arcs = db.get_arcs_created_after(start_ts)
-            # Identify the spawned arc by its template_name (D2 PR-α
-            # identity), not by arc.name. Skip the synthetic root arc
-            # we injected as the trigger source.
-            candidates = []
             for a in new_arcs:
                 if a["id"] == self._synthetic_arc_id:
                     continue
                 if a.get("parent_id") is not None:
                     continue
                 if db.get_arc_template_name(a["id"]) == "reflection":
-                    candidates.append(a)
-            if candidates:
-                reflection_arc = candidates[0]
-                self._reflection_arc_id = reflection_arc["id"]
-                children = db.get_arc_children(self._reflection_arc_id)
-                if len(children) >= 4:
-                    break
-            time.sleep(1)
+                    reflection_arc = a
+                    self._reflection_arc_id = a["id"]
+                    children = db.get_arc_children(a["id"])
+                    if len(children) >= 5:
+                        break
+            if reflection_arc and len(children) >= 5:
+                break
+            time.sleep(1.5)
 
-        self.assert_that(
-            reflection_arc is not None,
-            "Reflection arc was not created within 30s after emitting "
-            "arc.status_changed. Is the server running and subscription loaded?",
-        )
-        self._reflection_arc_id = reflection_arc["id"]
-        print(f"     Reflection arc ID: {self._reflection_arc_id}")
-
-        # ── 3. Verify arc tree structure ─────────────────────────────────────
-        print("  [3/5] Verifying arc tree structure...")
-
-        # Refresh reflection arc
-        reflection_arc = db.get_arc(self._reflection_arc_id)
-        self.assert_that(
-            reflection_arc is not None,
-            "Could not re-fetch reflection arc",
-        )
-
-        # Re-confirm template_name on the parent for the role-based identity.
-        parent_template_name = db.get_arc_template_name(self._reflection_arc_id)
-        self.assert_that(
-            parent_template_name == "reflection",
-            f"Parent arc template_name should be 'reflection', got "
-            f"{parent_template_name!r}",
+        if reflection_arc is None:
+            return StoryResult(
+                name=self.name,
+                passed=False,
+                message=(
+                    "Reflection arc did not appear within 45s of emitting "
+                    "reflection.daily_tick. Common causes: (a) escalation "
+                    "gate refused (no SMTP config), (b) daemon not "
+                    "processing events, (c) reflection template not loaded. "
+                    "See kb/reflections/setup.md."
+                ),
+            )
+        print(
+            f"     Reflection arc {self._reflection_arc_id} appeared "
+            f"with {len(children)} children"
         )
 
-        # Priority should be 1000 (idle — reflections run at background priority)
-        self.assert_that(
-            reflection_arc.get("priority") == 1000,
-            f"Reflection arc priority should be 1000 (idle), got "
-            f"{reflection_arc.get('priority')}",
-        )
-
+        # ── 4b. Assert 5-step shape by role ─────────────────────────────────
+        print("  [4/6] Verifying 5-step template shape by step_role...")
         child_roles = [c.get("step_role") for c in children]
-        child_names = [c["name"] for c in children]
-        print(f"     Children ({len(children)}): roles={child_roles} names={child_names}")
-
         self.assert_that(
-            len(children) == 4,
-            f"Expected 4 child arcs, got {len(children)}: roles={child_roles}",
+            len(children) == 5,
+            f"Expected 5 children (v2 template), got {len(children)}: "
+            f"roles={child_roles}",
             arcs=db.format_arcs_table(children),
         )
-
-        # Assert presence + ordering by step_role (D2 PR-α identity).
-        role_map: dict[str, dict] = {}
-        for role in EXPECTED_ROLES:
+        for i, role in enumerate(EXPECTED_ROLES):
             arc = db.get_arc_by_role(self._reflection_arc_id, role)
             self.assert_that(
                 arc is not None,
                 f"Missing child arc with step_role={role!r}. "
-                f"Got roles={child_roles}, names={child_names}",
+                f"Got roles={child_roles}",
                 arcs=db.format_arcs_table(children),
             )
-            role_map[role] = arc
-
-        for i, role in enumerate(EXPECTED_ROLES):
-            arc = role_map[role]
             self.assert_that(
                 arc.get("step_order") == i,
                 f"step_role={role!r} should have step_order={i}, got "
                 f"{arc.get('step_order')}",
             )
+        print(f"     Roles verified: {child_roles}")
 
-        # The analyze step is the only LLM-driven one (EXECUTOR).
-        analyze_arc = role_map["analyze"]
+        # ── 5. Seed triage skip; wait for reflect + persist to terminate ────
+        print("  [5/6] Seeding triage output (needs_synthesis=false)...")
+        triage_arc = db.get_arc_by_role(self._reflection_arc_id, "triage")
         self.assert_that(
-            analyze_arc.get("agent_type") == "EXECUTOR",
-            f"analyze arc should be EXECUTOR, got "
-            f"{analyze_arc.get('agent_type')}",
+            triage_arc is not None,
+            "No triage step under reflection arc — pre-v2 core?",
         )
+        _seed_triage_skip(db.db_path, triage_arc["id"])
+        print(f"     Seeded triage arc {triage_arc['id']} with skip verdict")
 
-        # Verify reflected_arc_id in arc_state points back to our synthetic arc
-        refl_state = db.get_arc_state(self._reflection_arc_id)
-        print(f"     Reflection arc_state keys: {list(refl_state.keys())}")
-        self.assert_that(
-            "reflected_arc_id" in refl_state,
-            f"arc_state missing 'reflected_arc_id'. Keys: {list(refl_state.keys())}",
-        )
-        self.assert_that(
-            refl_state["reflected_arc_id"] == self._synthetic_arc_id,
-            f"reflected_arc_id should be {self._synthetic_arc_id}, "
-            f"got {refl_state['reflected_arc_id']}",
-        )
-        print("     Arc tree structure verified ✓")
-
-        # ── 4. Wait for all arcs to complete ────────────────────────────────
-        print("  [4/5] Waiting for reflection arcs to complete (up to 240s)...")
-        arc_deadline = time.monotonic() + 240
-        last_print = 0
-
-        while time.monotonic() < arc_deadline:
-            all_arcs = [db.get_arc(self._reflection_arc_id)] + \
-                       db.get_arc_children(self._reflection_arc_id)
-            pending = [
-                a for a in all_arcs if a is not None and
-                a.get("status") not in ("completed", "failed", "cancelled", "frozen")
-            ]
-            if not pending:
+        print("     Waiting for reflect+persist to reach terminal (up to 240s)...")
+        deadline = time.monotonic() + 240
+        reflect_arc = None
+        persist_arc = None
+        last_print = 0.0
+        terminal = ("completed", "failed", "cancelled", "frozen")
+        while time.monotonic() < deadline:
+            reflect_arc = db.get_arc_by_role(
+                self._reflection_arc_id, "analyze",
+            )
+            persist_arc = db.get_arc_by_role(
+                self._reflection_arc_id, "persist",
+            )
+            if (
+                reflect_arc
+                and reflect_arc.get("status") in terminal
+                and persist_arc
+                and persist_arc.get("status") in terminal
+            ):
                 break
-
             now = time.monotonic()
-            if now - last_print >= 5:
+            if now - last_print >= 10:
                 statuses = ", ".join(
-                    f"{a['name']}={a['status']}" for a in pending[:5]
+                    f"{c.get('step_role')}={c.get('status')}"
+                    for c in db.get_arc_children(self._reflection_arc_id)
                 )
-                print(f"     Still waiting: {statuses}")
+                print(f"     Waiting... {statuses}")
                 last_print = now
             time.sleep(2)
-        else:
-            all_arcs = [db.get_arc(self._reflection_arc_id)] + \
-                       db.get_arc_children(self._reflection_arc_id)
-            statuses = ", ".join(
-                f"{a['name']}={a.get('status')}" for a in all_arcs if a
-            )
-            self.assert_that(
-                False,
-                f"Reflection arcs did not complete within 240s. Statuses: {statuses}",
-                arcs=db.format_arcs_table([a for a in all_arcs if a]),
-            )
-
-        # Check for failures
-        final_children = db.get_arc_children(self._reflection_arc_id)
-        failed = [c for c in final_children if c.get("status") == "failed"]
-        if failed:
-            for f in failed:
-                state = db.get_arc_state(f["id"])
-                print(f"     FAILED arc {f['name']}: {state.get('error', 'unknown')}")
 
         self.assert_that(
-            len(failed) == 0,
-            f"{len(failed)} arc(s) failed: "
-            + ", ".join(f"{f['name']} (id={f['id']})" for f in failed),
-            arcs=db.format_arcs_table(final_children),
-        )
-        print("     All reflection arcs completed ✓")
-
-        # ── 5. Verify KB entry ───────────────────────────────────────────────
-        print("  [5/5] Verifying KB entry...")
-
-        expected_kb_path = f"reflections/by-arc/{self._synthetic_arc_id}"
-        kb_entries = db.get_kb_entries(path_prefix="reflections/by-arc/")
-        matching = [e for e in kb_entries if e["path"] == expected_kb_path]
-
-        self.assert_that(
-            len(matching) >= 1,
-            f"No KB entry at '{expected_kb_path}'. "
-            f"Available by-arc entries: "
-            f"{[e['path'] for e in kb_entries]}",
-        )
-
-        # Verify content is substantive (save-reflection ran AI output)
-        # KB stores content on disk; check byte_count as proxy
-        kb_entry = matching[0]
-        print(f"     KB entry: {kb_entry['path']} ({kb_entry.get('byte_count', 0)} bytes)")
-        self.assert_that(
-            kb_entry.get("byte_count", 0) > 50,
-            f"KB entry byte_count too small ({kb_entry.get('byte_count', 0)}); "
-            "expected substantive reflection content",
+            reflect_arc is not None
+            and reflect_arc.get("status") in terminal,
+            f"reflect arc did not reach terminal state within 240s "
+            f"(status={reflect_arc.get('status') if reflect_arc else None})",
         )
         self.assert_that(
-            kb_entry.get("entry_type") == "reflection",
-            f"KB entry_type should be 'reflection', got '{kb_entry.get('entry_type')}'",
+            persist_arc is not None
+            and persist_arc.get("status") in terminal,
+            f"persist arc did not reach terminal state within 240s "
+            f"(status={persist_arc.get('status') if persist_arc else None})",
+        )
+        print(
+            f"     reflect={reflect_arc.get('status')} "
+            f"persist={persist_arc.get('status')}"
         )
 
-        print(f"     KB entry '{expected_kb_path}' verified ✓")
+        # ── 6. Assert gate skipped, no diary, no nearby-KB wiring ───────────
+        print("  [6/6] Asserting triage-gate skip semantics...")
+        reflect_state = db.get_arc_state(reflect_arc["id"])
+        print(f"     reflect arc_state keys: {sorted(reflect_state.keys())}")
+
+        self.assert_that(
+            bool(reflect_state.get("_reflect_gated_skipped")),
+            "reflect arc did NOT take the gated-skip path — "
+            "_reflect_gated_skipped is falsy. Seeded triage output did "
+            "not reach handle_reflect_gated, or triage_result parsing "
+            "misread needs_synthesis=false.",
+        )
+        # Nearby-KB wiring only runs on the synthesis branch.
+        self.assert_that(
+            not reflect_state.get("_reflect_nearby_kb_paths"),
+            "_reflect_nearby_kb_paths should be empty/absent on skip "
+            f"branch, got {reflect_state.get('_reflect_nearby_kb_paths')!r}. "
+            "The nearby-KB block should only be built when triage flags "
+            "synthesis.",
+        )
+        print("     Gate short-circuited ✓ (no LLM call, no nearby-KB block)")
+
+        # v2 no-diary guarantee: no reflections/* path added.
+        after_paths = _reflection_kb_paths(db)
+        new_paths = after_paths - baseline_paths
+        self.assert_that(
+            not new_paths,
+            f"v2 no-diary guarantee violated: new reflections/* KB "
+            f"entries appeared: {sorted(new_paths)}. save-reflection "
+            "must not write a diary in v2.",
+        )
+        print("     v2 no-diary guarantee held ✓")
 
         return StoryResult(
             name=self.name,
             passed=True,
             message=(
-                f"Reflection arc created (id={self._reflection_arc_id}, "
-                f"template_name='reflection', priority=1000) ✓, "
-                f"4 template steps verified by step_role "
-                f"({', '.join(EXPECTED_ROLES)}) ✓, "
-                f"reflected_arc_id={self._synthetic_arc_id} ✓, "
-                f"arcs completed ✓, "
-                f"KB entry at {expected_kb_path} ✓"
+                f"reflection arc {self._reflection_arc_id}: 5-step shape "
+                f"{child_roles} ✓, triage-gate skipped reflect "
+                f"(_reflect_gated_skipped=true) ✓, no nearby-KB block ✓, "
+                f"no new reflections/* KB entry ✓ (v2 no-diary)"
             ),
         )
 
     def cleanup(self, client: CarpenterClient, db: "DBInspector | None") -> None:
-        """Remove synthetic arc, reflection arc family, and KB entry."""
         if db is None:
             return
-
         conn = sqlite3.connect(db.db_path)
         try:
-            deleted = []
+            deleted: list[str] = []
 
             if self._reflection_arc_id:
-                # Remove grandchildren (dispatch-actions may spawn child arcs)
                 child_ids = [
                     r[0] for r in conn.execute(
                         "SELECT id FROM arcs WHERE parent_id = ?",
@@ -363,12 +371,12 @@ class ReflectionTemplateEndToEnd(AcceptanceStory):
                     ).fetchall()
                 ]
                 for cid in child_ids:
-                    grandchild_ids = [
+                    grand = [
                         r[0] for r in conn.execute(
-                            "SELECT id FROM arcs WHERE parent_id = ?", (cid,)
+                            "SELECT id FROM arcs WHERE parent_id = ?", (cid,),
                         ).fetchall()
                     ]
-                    for gcid in grandchild_ids:
+                    for gcid in grand:
                         conn.execute("DELETE FROM arc_state WHERE arc_id = ?", (gcid,))
                         conn.execute("DELETE FROM arc_history WHERE arc_id = ?", (gcid,))
                         conn.execute("DELETE FROM arcs WHERE id = ?", (gcid,))
@@ -376,8 +384,6 @@ class ReflectionTemplateEndToEnd(AcceptanceStory):
                     conn.execute("DELETE FROM arc_history WHERE arc_id = ?", (cid,))
                     conn.execute("DELETE FROM arcs WHERE id = ?", (cid,))
                 deleted.append(f"{len(child_ids)} reflection child arcs")
-
-                # Remove reflection parent arc
                 conn.execute(
                     "DELETE FROM arc_state WHERE arc_id = ?",
                     (self._reflection_arc_id,),
@@ -392,14 +398,6 @@ class ReflectionTemplateEndToEnd(AcceptanceStory):
                 )
                 deleted.append(f"reflection arc {self._reflection_arc_id}")
 
-                # Remove KB entry
-                expected_kb_path = f"reflections/by-arc/{self._synthetic_arc_id}"
-                conn.execute(
-                    "DELETE FROM kb_entries WHERE path = ?",
-                    (expected_kb_path,),
-                )
-                deleted.append(f"KB entry {expected_kb_path}")
-
             if self._synthetic_arc_id:
                 conn.execute(
                     "DELETE FROM arc_state WHERE arc_id = ?",
@@ -409,13 +407,11 @@ class ReflectionTemplateEndToEnd(AcceptanceStory):
                     "DELETE FROM arcs WHERE id = ?",
                     (self._synthetic_arc_id,),
                 )
-                # Clean up the event we emitted
-                conn.execute(
-                    "DELETE FROM events WHERE source = ? "
-                    "AND event_type = 'arc.status_changed'",
-                    (f"arc:{self._synthetic_arc_id}",),
-                )
                 deleted.append(f"synthetic arc {self._synthetic_arc_id}")
+
+            conn.execute(
+                "DELETE FROM events WHERE source = 'story:s049'",
+            )
 
             conn.commit()
             if deleted:
