@@ -254,8 +254,12 @@ def test_two_way_fallback_when_old_archive_missing(db_conn, tmp_path):
     src = _make_src(tmp_path, name, "1.0.0", {"a.txt": "alpha\n"})
     dest = tmp_path / "installed" / name
     install_package(src, dest, conn=db_conn)
-    # NOTE: we deliberately do NOT cache the pristine archive, and the fetcher
-    # raises → shipped_old unrecoverable → two-way (current vs new).
+    # install_package now (PR #45) auto-caches the pristine archive; to
+    # simulate the "shipped_old unrecoverable" scenario (no cache, offline)
+    # we delete that cached archive.  Combined with the raising fetcher
+    # below, load_pristine_tree fails → two-way (current vs new) fallback.
+    cached = archive_cache._archive_path(name, "1.0.0")
+    cached.unlink(missing_ok=True)
     new_src = _make_src(tmp_path, name, "2.0.0", {"a.txt": "alpha v2\n"})
 
     out = io.StringIO()
