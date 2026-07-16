@@ -81,7 +81,11 @@ from user_stories.framework import (
 
 
 _SEEDED_KB_PATH = "topics/s059-reflection-test-topic"
-_SEEDED_KB_TITLE = "S059 test topic (reflection edit-target seed)"
+_SEEDED_KB_DESCRIPTION = (
+    "Seeded by s059 acceptance story for reflection wiring test. "
+    "Keywords: s059-reflection-test-topic reflection acceptance "
+    "edit-target prefer-edit-over-create."
+)
 _SEEDED_KB_BODY = (
     "# S059 test topic\n\n"
     "This entry exists so the reflection pipeline can prefer editing it "
@@ -92,68 +96,58 @@ _SEEDED_KB_BODY = (
 )
 
 
-def _kb_entries_columns(db_path: str) -> list[str]:
-    conn = sqlite3.connect(db_path)
-    try:
-        return [
-            r[1] for r in conn.execute(
-                "PRAGMA table_info(kb_entries)"
-            ).fetchall()
-        ]
-    finally:
-        conn.close()
+def _seed_kb_entry() -> None:
+    """Seed the KB entry via ``KBStore.write_entry`` so the write goes
+    through the full index pipeline: filesystem file, ``kb_entries`` row,
+    ``kb_text_content`` body cache, and ``kb_embeddings`` vector row.
 
+    Directly ``INSERT``-ing into ``kb_entries`` alone would leave
+    ``kb_embeddings`` empty, and ``KBStore.search()`` — which is what
+    ``_build_nearby_kb_block(triage.focus_pointers)`` calls — queries
+    ``kb_embeddings`` only.  The seed would then be invisible and this
+    story's central assertion (``_SEEDED_KB_PATH in nearby_paths``) would
+    fail on any real deployment run.
 
-def _seed_kb_entry(db_path: str) -> None:
-    """Insert (or refresh) the seeded KB entry.
-
-    Uses whichever columns exist on this deployment's ``kb_entries``
-    schema. Older revs store body on disk only; the search index still
-    hits by title/description/path.
+    The story process runs separately from the daemon, so it must
+    ``reload_config()`` before touching the store; that resolves the
+    same ``db_path`` and ``kb_dir`` the daemon uses.  SQLite WAL mode
+    tolerates the extra writer.
     """
-    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    cols = _kb_entries_columns(db_path)
-    has_body = "body" in cols
-    conn = sqlite3.connect(db_path)
+    from carpenter import config
+    from carpenter.kb import get_store
+
+    config.reload_config()
+    store = get_store()
+    result = store.write_entry(
+        path=_SEEDED_KB_PATH,
+        content=_SEEDED_KB_BODY,
+        description=_SEEDED_KB_DESCRIPTION,
+        entry_type="knowledge",
+        trust_level="trusted",
+        validate_links=False,
+    )
+    if result.startswith("Error"):
+        raise RuntimeError(f"KBStore.write_entry failed: {result}")
+
+
+def _delete_kb_entry() -> str | None:
+    """Symmetric cleanup: filesystem file + ``kb_entries`` row +
+    ``kb_links`` + ``kb_text_content`` + ``kb_embeddings``.
+
+    Returns an error string on failure, ``None`` on success.
+    """
     try:
-        if has_body:
-            conn.execute(
-                "INSERT OR REPLACE INTO kb_entries "
-                "(path, title, description, entry_type, byte_count, "
-                "created_at, updated_at, body) "
-                "VALUES (?, ?, ?, 'note', ?, ?, ?, ?)",
-                (
-                    _SEEDED_KB_PATH,
-                    _SEEDED_KB_TITLE,
-                    "Seeded by s059 acceptance story for reflection wiring test",
-                    len(_SEEDED_KB_BODY),
-                    now_iso,
-                    now_iso,
-                    _SEEDED_KB_BODY,
-                ),
-            )
-        else:
-            conn.execute(
-                "INSERT OR REPLACE INTO kb_entries "
-                "(path, title, description, entry_type, byte_count, "
-                "created_at, updated_at) "
-                "VALUES (?, ?, ?, 'note', ?, ?, ?)",
-                (
-                    _SEEDED_KB_PATH,
-                    _SEEDED_KB_TITLE,
-                    (
-                        "Seeded by s059 acceptance story. Keywords: "
-                        "s059-reflection-test-topic reflection acceptance "
-                        "edit-target prefer-edit-over-create."
-                    ),
-                    len(_SEEDED_KB_BODY),
-                    now_iso,
-                    now_iso,
-                ),
-            )
-        conn.commit()
-    finally:
-        conn.close()
+        from carpenter import config
+        from carpenter.kb import get_store
+
+        config.reload_config()
+        store = get_store()
+        result = store.delete_entry(_SEEDED_KB_PATH)
+        if result.startswith("Error"):
+            return result
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return f"delete_entry raised: {exc}"
 
 
 def _insert_synthetic_root_arc(db_path: str) -> int:
@@ -273,7 +267,7 @@ class ReflectionPrefersEdit(AcceptanceStory):
 
         # ── 1. Seed KB entry ────────────────────────────────────────────────
         print(f"\n  [1/6] Seeding KB entry at {_SEEDED_KB_PATH}...")
-        _seed_kb_entry(db.db_path)
+        _seed_kb_entry()
         self._kb_seeded = True
         entries = db.get_kb_entries(path_prefix="topics/")
         self.assert_that(
@@ -504,13 +498,6 @@ class ReflectionPrefersEdit(AcceptanceStory):
                 )
                 deleted.append(f"synthetic arc {self._synthetic_arc_id}")
 
-            if self._kb_seeded:
-                conn.execute(
-                    "DELETE FROM kb_entries WHERE path = ?",
-                    (_SEEDED_KB_PATH,),
-                )
-                deleted.append(f"KB entry {_SEEDED_KB_PATH}")
-
             # Story-emitted events / watermark left in place: the
             # reflection_last_tick watermark will be advanced by the
             # next real tick.
@@ -519,9 +506,21 @@ class ReflectionPrefersEdit(AcceptanceStory):
             )
 
             conn.commit()
-            if deleted:
-                print(f"  [cleanup] Removed: {', '.join(deleted)}")
         except Exception as exc:
             print(f"  [cleanup] Error: {exc}")
         finally:
             conn.close()
+
+        # KB entry deletion uses the symmetric KBStore API so that the
+        # filesystem file, ``kb_entries`` row, ``kb_links`` rows,
+        # ``kb_text_content`` body cache, and ``kb_embeddings`` vector
+        # row are all removed together — matching the seed path.
+        if self._kb_seeded:
+            err = _delete_kb_entry()
+            if err is None:
+                deleted.append(f"KB entry {_SEEDED_KB_PATH}")
+            else:
+                print(f"  [cleanup] KB delete error: {err}")
+
+        if deleted:
+            print(f"  [cleanup] Removed: {', '.join(deleted)}")
