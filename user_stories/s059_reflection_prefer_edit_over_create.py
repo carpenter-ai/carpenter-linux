@@ -5,8 +5,8 @@ Verifies the "prefer edit over create" wiring added in the v2 reflection
 pipeline (carpenter-core PR #86): when the triage step surfaces a focus
 pointer covering an existing KB entry, the reflect step's rendered goal
 contains a "Nearby KB entries" block referencing that path, so the
-reflect agent can populate ``kb_edit_targets`` with it instead of
-proposing a brand-new path.
+reflect agent can set a proposed action's ``target_path`` to that path
+instead of proposing a brand-new one.
 
 Background — v2 reflection pipeline
 -----------------------------------
@@ -60,8 +60,14 @@ feedback loop. The story:
       triage seed took effect and the LLM path ran.
 
 If the agent produces a parseable ``ReflectionResult`` whose
-``kb_edit_targets`` contains the seeded path, that's *reported* as a
-best-effort bonus but not asserted — the LLM's selection is variable.
+``proposed_actions[].target_path`` contains the seeded path, that's
+*reported* as a best-effort bonus but not asserted — the LLM's
+selection is variable. The story also asserts (hard) that no
+proposed action's ``target_path`` matches the prompt's forbidden
+diary-shape pattern (``reflections/*``, dated components, etc.);
+the dispatch-actions handler drops such targets, so if the LLM
+emitted any this run they will surface here as a regression signal
+before dispatch strips them silently.
 
 Cleanup: removes the seeded KB entry, the synthetic subject arc, the
 reflection arc family, and the emitted event / watermark.
@@ -426,27 +432,67 @@ class ReflectionPrefersEdit(AcceptanceStory):
             f"{nearby_paths}"
         )
 
-        # Bonus (non-asserted): did the agent honour the hint?
+        # Parse the reflect agent's ReflectionResult (tolerating a
+        # ``` fence around the JSON, matching the handler's parser).
         raw = reflect_state.get("_agent_response")
-        agent_targets: list[str] = []
+        agent_proposed: list[dict] = []
         if isinstance(raw, str):
+            text = raw.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1] if "\n" in text else ""
+                if text.endswith("```"):
+                    text = text[:-3]
+                text = text.strip()
             try:
-                inner = json.loads(raw)
+                inner = json.loads(text)
                 if isinstance(inner, dict):
-                    agent_targets = list(inner.get("kb_edit_targets") or [])
+                    agent_proposed = list(inner.get("proposed_actions") or [])
             except (TypeError, json.JSONDecodeError):
                 pass
-        if agent_targets:
-            hit = _SEEDED_KB_PATH in agent_targets
+
+        # Bonus (non-asserted): did the agent target one of the
+        # nearby-KB paths surfaced to it?
+        target_paths = [
+            (a.get("target_path") or "").strip()
+            for a in agent_proposed
+            if isinstance(a, dict)
+        ]
+        target_paths = [tp for tp in target_paths if tp]
+        nearby_hits = [tp for tp in target_paths if tp in nearby_paths]
+        if target_paths:
             print(
-                f"     [bonus] agent kb_edit_targets={agent_targets} "
-                f"(seeded path {'hit' if hit else 'missed'})"
+                f"     [bonus] agent target_paths={target_paths} "
+                f"(nearby-hit: {nearby_hits or 'none'})"
             )
         else:
             print(
-                "     [bonus] agent produced no kb_edit_targets "
+                "     [bonus] agent produced no target_paths "
                 "(unparseable or empty — not a story failure)"
             )
+
+        # Hard assertion: the agent must NOT propose a diary-shape
+        # target_path. Dispatch drops these silently as a safety net;
+        # surfacing here catches prompt regressions before that mask.
+        _DIARY_PREFIXES = (
+            "reflections/", "by-day/", "by-arc/",
+            "daily/", "weekly/", "monthly/",
+        )
+        import re as _re
+        _DATE_RE = _re.compile(r"(?:^|[/_-])\d{4}-\d{2}-\d{2}(?:[/_-]|$)")
+        offenders: list[str] = []
+        for tp in target_paths:
+            lower = tp.lower().lstrip("/")
+            if any(lower.startswith(p) for p in _DIARY_PREFIXES):
+                offenders.append(tp)
+            elif _DATE_RE.search(lower):
+                offenders.append(tp)
+        self.assert_that(
+            not offenders,
+            "Reflect agent proposed diary-shape target_path values "
+            f"despite the prompt's ban: {offenders}. The prompt "
+            "explicitly forbids ``reflections/*``, dated components, "
+            "``by-day/*``, etc. If this fires, tighten reflect-goal.md.",
+        )
 
         return StoryResult(
             name=self.name,
