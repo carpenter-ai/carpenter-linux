@@ -10,3 +10,6 @@ build/
 *.db
 *.db-wal
 *.db-shm
+
+# Claude Code worktrees live here; never commit one.
+.claude/worktrees/
