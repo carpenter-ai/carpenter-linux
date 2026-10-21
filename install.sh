@@ -1138,6 +1138,37 @@ tls_key_path: "$TLS_KEY_PATH"
 tls_ca_path: "$TLS_CA_PATH"
 # tls_key_password: set TLS_KEY_PASSWORD in .env or environment if your private key is encrypted
 
+# ─── Capability packages ─────────────────────────────────────────────
+# Where a bare capability-package name may be installed from. Empty (the
+# default) means the local source tree. The FIRST entry wins for a bare
+# name — resolution does no I/O, so it cannot fall through to the next
+# source; give a full `git+https://host/org/repo.git[@ref][#subdir=path]`
+# or `https://host/path/pkg.tar.gz[#sha256=...]` spec to name any other.
+# A host that is not publicly routable also needs an entry in
+# web_egress_allowlist. See carpenter-core docs/package-sources.md.
+package_sources: []
+#  - name: house
+#    url: git+https://forge.example/org/packages.git
+#    subdir_template: packages/{name}       # omit when the repo IS one package
+#    credential_ref: HOUSE_FORGE_TOKEN      # a variable NAME, never a value
+package_sources_listing_ttl_hours: 6
+
+# Bounds on chat-requested installs: the agent asks, a human approves on a
+# one-time link, and the platform installs afterwards. Nothing is ever
+# auto-approved, whatever these are set to.
+package_install:
+  request_ttl_hours: 24
+  approved_grace_hours: 6
+  max_open_requests: 3
+  max_requests_per_hour: 5
+  max_sources_per_request: 5
+  notify_agent: false     # true re-invokes the chat agent on each outcome
+  # Ceilings on one fetch of untrusted bytes; defaults shown.
+  # max_fetch_bytes: 67108864
+  # max_fetch_files: 5000
+  # max_fetch_file_bytes: 16777216
+  # fetch_timeout_s: 60
+
 # Notification channels
 notifications:
   email:
