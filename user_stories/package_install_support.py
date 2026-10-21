@@ -684,28 +684,6 @@ def delete_install_record(db, name: str) -> int:
         conn.close()
 
 
-def set_recorded_ref(db, name: str, ref: str) -> None:
-    """Repoint an install's recorded ``source_ref``.
-
-    Used by s065 only, and the one piece of scaffolding in these
-    stories: ``packages update`` takes no ``--ref`` and deliberately
-    follows ``installed_packages.source_ref``, because following the ref
-    is what an update *is*. A fixture repository is static, so the only
-    way to make a newer version available to a recorded ref is to point
-    the record at the newer ref — exactly the state a deployment is in
-    when the branch it tracks has moved. See s065's docstring.
-    """
-    conn = sqlite3.connect(db.db_path)
-    try:
-        conn.execute(
-            "UPDATE installed_packages SET source_ref = ? WHERE name = ?",
-            (ref, name),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
 # ── tool_calls ──────────────────────────────────────────────────────
 
 def tool_calls(db, conversation_id: int, tool_name: str = "") -> list[dict]:

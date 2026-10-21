@@ -8,8 +8,9 @@ upstream has changed in the newer revision. Upgrading must keep the
 first edit and must refuse the second until someone says, explicitly,
 that the new version wins there.
 
-The upgrade verb is ``python3 -m carpenter packages update <name>``
-and it is **operator-only by design**: there is no chat tool, no HTTP
+The upgrade verb is
+``python3 -m carpenter packages update <name> [--ref <ref>]`` and it is
+**operator-only by design**: there is no chat tool, no HTTP
 route and no arc that performs it, because an upgrade can overwrite an
 operator's own edits and the person who made them is the only one who
 can weigh that. So this story shells out to the CLI rather than asking
@@ -24,8 +25,10 @@ Preconditions (environment variables; the story SKIPS when absent)
       Must need no read credential.
   CARPENTER_TEST_PKG_OLD_REF
       A ref (tag or commit) holding an OLDER version of the package.
+      The story installs this one.
   CARPENTER_TEST_PKG_REF
-      The newer ref to upgrade to. Required here, unlike in s060.
+      A ref carrying a NEWER version of the same package. Required
+      here, unlike in s060: it is what ``--ref`` is pointed at.
   CARPENTER_TEST_PKG_EDIT_FILE
       Path, relative to the package root, of a file that is byte-identical
       in both refs and where an appended comment line is harmless. The
@@ -36,20 +39,21 @@ Preconditions (environment variables; the story SKIPS when absent)
   CARPENTER_TEST_PKG_SUBDIR  (optional)
       Package subdirectory inside the repository.
 
-What is simulated, and what is real
------------------------------------
+What the fixture has to provide
+-------------------------------
 
-``packages update`` takes no ``--ref``: it deliberately follows the ref
-recorded on the install (``installed_packages.source_ref``), because
-following the ref is what an update *is*. A fixture repository is
-static, so the only way to put a newer version in front of a recorded
-ref is to point the record at the newer ref — which is exactly the
-state a deployment reaches on its own when the branch it tracks moves.
-The story therefore performs one UPDATE on ``source_ref`` between the
-install and the upgrade, and says so here rather than hiding it. Every
-other step is the real thing: the real fetch, the real three-way merge
-against the real pristine archive of the installed version, the real
-conflict refusal, the real on-disk result.
+Nothing here is simulated. An update follows a ref, so for a package
+installed at one ref to have anything to upgrade *to*, a newer version
+of it must exist at another ref — that is a fixture prerequisite, and
+both refs are required environment variables. The story moves between
+them the way an operator moves a package from one tag to the next:
+``packages update <name> --ref <ref>``, which fetches that ref and then
+REMEMBERS it as the package's recorded ``source_ref``, so later updates
+follow it too. The story writes nothing to the database itself.
+
+Everything else is the real thing as well: the real fetch, the real
+three-way merge against the real pristine archive of the installed
+version, the real conflict refusal, the real on-disk result.
 
 What this story asserts (STRICT)
 --------------------------------
@@ -58,21 +62,30 @@ What this story asserts (STRICT)
    recording ``source_ref`` as the older ref.
 2. Both fixture files exist in the installed tree, and the operator's
    edits land in them.
-3. ``packages update <name> --yes`` REFUSES: exit code 1, an error
-   naming the conflicting file and saying nothing was changed. The plan
-   it printed says ``Strategy : reconcile`` — a three-way merge against
-   the pristine tree of the installed version — so the refusal is the
-   conflict gate, not the fallback that replaces the tree wholesale.
-4. The refusal changed nothing: the installed version, hash and both
-   files on disk are exactly as they were.
-5. ``packages update <name> --yes --accept-conflicts`` then succeeds:
-   exit code 0, and its report says the operator's edit was KEPT in the
-   untouched file and DISCARDED in the conflicting one.
+3. ``packages update <name> --ref <newer> --yes`` REFUSES: exit code 1,
+   an error naming the conflicting file and saying nothing was changed.
+   The plan it printed names the ref it was given — the ``--ref`` line
+   that says the ref will be recorded when the update is applied — and
+   says ``Strategy : reconcile``, a three-way merge against the pristine
+   tree of the installed version, so the refusal is the conflict gate
+   and not the fallback that replaces the tree wholesale.
+4. The refusal changed nothing: the installed version, hash, recorded
+   ref and both files on disk are exactly as they were. In particular
+   the ref is NOT recorded by a run that refused to apply anything.
+5. The same command with ``--accept-conflicts`` then succeeds: exit code
+   0, and its report says the operator's edit was KEPT in the untouched
+   file and DISCARDED in the conflicting one.
 6. On disk, that is true: the operator's marker is still in the file
    upstream did not change, and gone from the file it did.
 7. The install record moved to the new version, with ``source_resolved``
    now a different commit and ``shipped_hash`` recorded — so the next
    upgrade has a pristine anchor to merge against.
+8. ``source_ref`` is now the newer ref. That is the operator-visible
+   half of ``--ref``: the package goes on being followed from where it
+   was pointed, rather than snapping back to the ref it was installed
+   at. (Asserted on the recorded ref rather than by a third fetch: a
+   plain update afterwards would re-plan against the merged tree, which
+   is a different property from this one.)
 
 Cleanup: uninstalls the package, removes a leftover tree, deletes its
 request row, restores ``config.yaml`` byte for byte.
@@ -160,7 +173,7 @@ class UpdatePackageKeepsOperatorEdit(AcceptanceStory):
         self._config.apply()
 
         # ── 1. Install the older version through the chat flow ──────
-        print(f"\n  [1/7] Installing {name} at {old_ref} over chat")
+        print(f"\n  [1/6] Installing {name} at {old_ref} over chat")
         conv_id, reply = client.chat(
             "Please install the capability package at this exact "
             f"revision: {old_spec}",
@@ -206,7 +219,7 @@ class UpdatePackageKeepsOperatorEdit(AcceptanceStory):
         print(f"     installed v{old_version} at {tree}")
 
         # ── 2. The operator edits two files ─────────────────────────
-        print("  [2/7] Making the operator's edits")
+        print("  [2/6] Making the operator's edits")
         edit_path = tree / edit_rel
         conflict_path = tree / conflict_rel
         for rel, path in ((edit_rel, edit_path), (conflict_rel, conflict_path)):
@@ -230,17 +243,14 @@ class UpdatePackageKeepsOperatorEdit(AcceptanceStory):
         )
         print(f"     appended {marker!r} to both files")
 
-        # ── 3. Point the recorded ref at the newer revision ─────────
-        print(f"  [3/7] Repointing the recorded source_ref to {new_ref}")
-        support.set_recorded_ref(db, name, new_ref)
-        self.assert_that(
-            (support.install_record(db, name)["source_ref"] or "") == new_ref,
-            "The recorded source_ref was not repointed",
+        # ── 3. The upgrade refuses the conflict ─────────────────────
+        print(
+            f"  [3/6] Running `packages update --ref {new_ref}` — "
+            f"expecting a refusal"
         )
-
-        # ── 4. The upgrade refuses the conflict ─────────────────────
-        print("  [4/7] Running `packages update` — expecting a refusal")
-        refused = support.run_packages_cli("update", name, "--yes")
+        refused = support.run_packages_cli(
+            "update", name, "--ref", new_ref, "--yes",
+        )
         plan_and_error = (refused.stderr or "") + (refused.stdout or "")
         self.assert_that(
             refused.returncode == 1,
@@ -255,6 +265,15 @@ class UpdatePackageKeepsOperatorEdit(AcceptanceStory):
             "of the installed version; a 'clobber' plan here would mean "
             "the pristine archive was missing and local edits were never "
             "going to survive",
+        )
+        ref_lines = [
+            line for line in plan_and_error.splitlines() if "--ref;" in line
+        ]
+        self.assert_that(
+            len(ref_lines) == 1 and new_ref in ref_lines[0],
+            f"The plan must name the ref it was given, and say it will be "
+            f"recorded when the update is applied; got {ref_lines!r}",
+            plan=plan_and_error[:800],
         )
         self.assert_contains(
             plan_and_error, "CONFLICTS",
@@ -274,8 +293,8 @@ class UpdatePackageKeepsOperatorEdit(AcceptanceStory):
         )
         print(f"     refused: {(refused.stderr or '').strip()[-220:]}")
 
-        # ── 5. The refusal changed nothing ──────────────────────────
-        print("  [5/7] Asserting the refusal changed nothing")
+        # ── 4. The refusal changed nothing ──────────────────────────
+        print("  [4/6] Asserting the refusal changed nothing")
         mid = support.install_record(db, name)
         self.assert_that(
             mid["version"] == old_version and mid["hash"] == old_hash,
@@ -284,15 +303,21 @@ class UpdatePackageKeepsOperatorEdit(AcceptanceStory):
             f"{mid['version']}/{mid['hash'][:12]}",
         )
         self.assert_that(
+            (mid["source_ref"] or "") == old_ref,
+            f"The refused upgrade recorded the new ref anyway "
+            f"({mid['source_ref']!r}): a run that applied nothing must "
+            f"not move where the package is followed from",
+        )
+        self.assert_that(
             marker in edit_path.read_text(encoding="utf-8")
             and marker in conflict_path.read_text(encoding="utf-8"),
             "The refused upgrade touched the operator's files",
         )
 
-        # ── 6. Accepting conflicts applies the merge ────────────────
-        print("  [6/7] Running `packages update --accept-conflicts`")
+        # ── 5. Accepting conflicts applies the merge ────────────────
+        print("  [5/6] Running the same command with --accept-conflicts")
         applied = support.run_packages_cli(
-            "update", name, "--yes", "--accept-conflicts",
+            "update", name, "--ref", new_ref, "--yes", "--accept-conflicts",
         )
         report = (applied.stdout or "") + (applied.stderr or "")
         self.assert_that(
@@ -336,8 +361,8 @@ class UpdatePackageKeepsOperatorEdit(AcceptanceStory):
         )
         print(f"     {(applied.stdout or '').strip().splitlines()[0][:160]}")
 
-        # ── 7. On disk and in the record ────────────────────────────
-        print("  [7/7] Checking the merged tree and the new record")
+        # ── 6. On disk and in the record ────────────────────────────
+        print("  [6/6] Checking the merged tree and the new record")
         self.assert_that(
             marker in edit_path.read_text(encoding="utf-8"),
             f"The operator's edit to {edit_rel!r} did not survive the "
@@ -376,12 +401,20 @@ class UpdatePackageKeepsOperatorEdit(AcceptanceStory):
             "shipped, and the two columns must say so",
             hash=after["hash"], shipped_hash=after["shipped_hash"],
         )
+        self.assert_that(
+            (after["source_ref"] or "") == new_ref,
+            f"source_ref should now be the ref --ref named ({new_ref!r}), "
+            f"got {after['source_ref']!r}. The flag is persistent by "
+            f"design: the package goes on being followed from where it "
+            f"was pointed instead of snapping back to {old_ref!r}.",
+        )
 
         elapsed = time.time() - start_ts
         return self.result(
             f"{name} upgraded {old_version} -> {after['version']}: the "
             f"operator's edit to {edit_rel} survived, {conflict_rel} was "
-            f"refused until --accept-conflicts ({elapsed:.0f}s)"
+            f"refused until --accept-conflicts, and source_ref now "
+            f"follows {new_ref} ({elapsed:.0f}s)"
         )
 
     # ------------------------------------------------------------------
