@@ -23,7 +23,7 @@ pip install -e .
 
 ## Acceptance Tests
 
-47 end-to-end acceptance stories live in `user_stories/`. Run them against a live server:
+59 end-to-end acceptance stories live in `user_stories/`. Run them against a live server:
 
 ```bash
 python3 user_stories/runner.py          # all stories
@@ -31,3 +31,6 @@ python3 user_stories/runner.py s001     # single story
 ```
 
 See `user_stories/runner.py` header for environment variable configuration.
+Some stories need a fixture of their own (an external repository, a package
+source, a mailbox) and name the environment variables that supply it in their
+module docstring; they report SKIP rather than failing when those are unset.
