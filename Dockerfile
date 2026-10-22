@@ -10,6 +10,10 @@ RUN apt-get update && \
 COPY pyproject.toml .
 COPY carpenter_linux/ carpenter_linux/
 
+# The python:3.11 images ship pip 24.0, whose vendored certifi still trusts
+# the compromised "emSign ECC Root CA - G3". Upgrade pip and certifi first.
+RUN pip install --no-cache-dir --upgrade 'pip>=26.2.2' 'certifi>=2026.10.19'
+
 RUN pip install --no-cache-dir .
 
 # Create runtime directories (must match paths in docker/config.yaml)
