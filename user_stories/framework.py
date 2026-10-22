@@ -11,6 +11,7 @@ Provides the building blocks for writing acceptance stories:
 
 import json
 import sqlite3
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -1066,14 +1067,28 @@ class AcceptanceStory:
         return f"{prefix}-{self.run_id}-%"
 
     def run_workspace(self) -> Path:
-        """Return a per-run scratch directory on the ramdisk.
+        """Return a per-run scratch directory.
 
-        Lives under ``/dev/shm/carpenter-acceptance/{prefix}-{run_id}/``
-        so concurrent runs of the same story can't collide and heavy temp
-        I/O doesn't hit the SD card.  Created on first access.
+        Lives under ``{tempdir}/carpenter-acceptance/{prefix}-{run_id}/``,
+        so concurrent runs of the same story cannot collide.  Created on
+        first access.
+
+        ``tempdir`` is ``TMPDIR`` when the caller has set it, else the
+        platform default — which is where the choice belongs, because it is
+        a property of the host and not of the story.  This used to be
+        hardcoded to ``/dev/shm`` to spare an SD card the writes, and that
+        is the wrong default anywhere memory is capped: a tmpfs file is
+        charged to the cgroup that wrote it and is freed only when the file
+        is deleted, not when the story ends.  Note also that ``/tmp`` is
+        itself a tmpfs on many systems, so a disk-backed scratch may need
+        naming explicitly.
         """
         prefix = self.artifact_prefix or type(self).__name__.lower()
-        ws = Path("/dev/shm/carpenter-acceptance") / f"{prefix}-{self.run_id}"
+        ws = (
+            Path(tempfile.gettempdir())
+            / "carpenter-acceptance"
+            / f"{prefix}-{self.run_id}"
+        )
         ws.mkdir(parents=True, exist_ok=True)
         return ws
 
