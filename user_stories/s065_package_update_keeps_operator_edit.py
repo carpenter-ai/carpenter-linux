@@ -55,11 +55,27 @@ Everything else is the real thing as well: the real fetch, the real
 three-way merge against the real pristine archive of the installed
 version, the real conflict refusal, the real on-disk result.
 
+The hot-load outcome
+--------------------
+
+This story does not need the installed package to be live in the server
+process: what it asserts is the tree on disk, the DB record and the
+CLI's report, and the CLI tells the operator separately whether a
+restart is needed to run the new code. The install step still checks
+the load report against the same shared rule the other install stories
+use — a live load, or the documented refusal when this package's
+modules are already cached in that process — so an unrecognised
+failure there is not silently passed over. **A fresh platform process
+gives the first form; a second run in one process lifetime gives the
+second**, because the suite does not restart the platform and
+uninstalling cannot retract a hot-load.
+
 What this story asserts (STRICT)
 --------------------------------
 
 1. The older version installs through the normal two-phase chat flow,
-   recording ``source_ref`` as the older ref.
+   recording ``source_ref`` as the older ref, with a load outcome the
+   platform documents.
 2. Both fixture files exist in the installed tree, and the operator's
    edits land in them.
 3. ``packages update <name> --ref <newer> --yes`` REFUSES: exit code 1,
@@ -205,6 +221,14 @@ class UpdatePackageKeepsOperatorEdit(AcceptanceStory):
             f"Installing the older revision failed: "
             f"{installed.get('error')!r}",
             result=installed.get("result"),
+        )
+        # The same rule the other install stories use: a live load, or
+        # the documented module-cache refusal, and nothing else. Either
+        # is fine here — this story's subject is the on-disk tree and
+        # the CLI's report, neither of which depends on the package
+        # being live in the server process.
+        support.assert_hot_load(
+            self, support.package_block(installed, name), name,
         )
         before = support.install_record(db, name)
         self.assert_that(

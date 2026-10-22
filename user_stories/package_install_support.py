@@ -637,6 +637,113 @@ def delete_request_rows(db, tokens) -> int:
         conn.close()
 
 
+# ── the hot-load outcome ───────────────────────────────────────────
+#
+# An install registers the package's components in the running process
+# without a restart — but only when it CAN. The platform documents two
+# reasons it cannot, and a story that demands the live load every time
+# is a story that passes only on a platform process where that package
+# has never been installed.
+#
+# That is not a hypothetical: these stories do not restart the platform
+# (restarting the live service from inside a test is more disruptive
+# than any assertion here is worth), uninstalling cannot retract a
+# hot-load, and the module cache is per process. So the second install
+# of one package in one process lifetime — s060 then s061 on the same
+# fixture, or any story run twice — legitimately reports
+# ``needs_restart``.
+#
+# The rule below therefore accepts exactly the outcomes the platform
+# documents, and nothing else. It does NOT accept ``needs_restart``
+# with an unrecognised reason: a registration that failed, or a package
+# whose on-disk hash does not match its row, also arrive as "not
+# loaded", and those are real failures that must not hide behind this
+# tolerance.
+
+#: The live registration happened: fresh install in this process.
+HOT_LOAD_FRESH = "loaded live"
+
+#: Already registered in this process, with nothing stale cached — the
+#: components are live and no restart is implied.
+HOT_LOAD_ALREADY_LIVE = "already registered in this process"
+
+#: The documented refusal: this package's modules are already in
+#: ``sys.modules``, so a re-import would return the old module bodies.
+#: The package is installed and recorded; what is live in the process is
+#: the generation loaded earlier.
+HOT_LOAD_MODULE_CACHE = "module cache"
+
+#: Reasons that are weaker but still full strength on the install.
+HOT_LOAD_STRONG = (HOT_LOAD_FRESH, HOT_LOAD_ALREADY_LIVE)
+
+
+def classify_hot_load(block: dict, name: str) -> tuple[str, str]:
+    """Classify one package's ``result_json`` load report.
+
+    Returns ``(kind, reason)`` where *kind* is one of the three
+    ``HOT_LOAD_*`` constants, or ``""`` when the report is none of them
+    — which the caller must treat as a failure.
+
+    The module-cache case is identified by the platform's own words, not
+    by the story guessing at process history: the reason has to name
+    ``sys.modules`` *and* this package's module namespace. A message
+    about some other package, or a bare "needs a restart" with no such
+    evidence, does not qualify.
+    """
+    if not isinstance(block, dict):
+        return "", "no load report at all"
+    load = block.get("load")
+    if not isinstance(load, dict):
+        return "", "the live registration was not attempted"
+    reason = str(load.get("reason") or "")
+    loaded = load.get("loaded") is True
+    needs_restart = load.get("needs_restart") is True
+
+    if loaded and not needs_restart:
+        return HOT_LOAD_FRESH, reason
+    if not loaded and not needs_restart:
+        if "already registered in this process" in reason:
+            return HOT_LOAD_ALREADY_LIVE, reason
+        return "", reason
+    if not loaded and needs_restart:
+        namespace = f"_carpenter_pkg_.{name}."
+        if "sys.modules" in reason and namespace in reason:
+            return HOT_LOAD_MODULE_CACHE, reason
+        return "", reason
+    return "", reason
+
+
+def assert_hot_load(story, block: dict, name: str) -> str:
+    """Assert the load report is one the platform documents; return its kind.
+
+    Prints which form was obtained, so whoever reads the run can see
+    whether the strong or the weak branch was taken rather than having
+    to infer it from a pass.
+    """
+    kind, reason = classify_hot_load(block, name)
+    story.assert_that(
+        bool(kind),
+        f"The install of {name!r} reported a load outcome that is "
+        f"neither a live load nor a documented refusal: {reason!r}. "
+        f"A failed registration and a hash-pin mismatch also arrive as "
+        f"'not loaded', so this is not tolerated.",
+        load=block.get("load") if isinstance(block, dict) else None,
+    )
+    if kind in HOT_LOAD_STRONG:
+        print(f"     hot-load: {kind} ✓")
+    else:
+        print(
+            f"     hot-load: accepted the documented module-cache "
+            f"outcome: {name!r} was already loaded in this platform "
+            f"process, so this assertion is WEAKER than on a fresh "
+            f"process — the package is installed and recorded, but what "
+            f"is live is the generation loaded earlier, and activating "
+            f"the new code needs a platform restart. The platform's own "
+            f"words: {reason}"
+        )
+    return kind
+
+
 # ── installed_packages ─────────────────────────────────────────────
 
 PROVENANCE_COLUMNS = (
