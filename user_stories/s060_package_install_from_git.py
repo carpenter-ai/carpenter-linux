@@ -22,9 +22,10 @@ Preconditions (environment variables; the story SKIPS when absent)
       The ``name`` in that package's ``manifest.yaml``.
   CARPENTER_TEST_PKG_TOOL
       The name of a chat tool the package contributes. The story asks
-      the agent to call it after the install, which is what proves the
-      package hot-loaded into the *running* process rather than merely
-      landing on disk.
+      the agent to call it after the install: on a fresh platform
+      process that proves this install reached the *running* process
+      rather than merely landing on disk, and on a re-run it proves the
+      tool is still reachable there. See "The hot-load assertion".
   CARPENTER_TEST_PKG_SUBDIR    (optional)
       Path of the package root inside the repository, when the
       repository holds several. Omit when the repository root is the
@@ -67,8 +68,9 @@ What this story asserts (STRICT)
  7. The authenticated ``POST .../decide`` records the approval and
     queues the install.
  8. The work queue installs it: the row reaches ``installed`` and its
-    ``result_json`` reports this package as ``installed``, loaded live
-    with ``needs_restart`` false.
+    ``result_json`` reports this package as ``installed``, with a load
+    outcome the platform documents — see "The hot-load assertion"
+    below.
  9. The install record carries the provenance columns — ``source_kind``
     ``git``, a redacted-safe URL, the requested ref, the resolved
     commit, the subdir, the stable ``source_id``, ``fetched_at`` — and
@@ -76,6 +78,30 @@ What this story asserts (STRICT)
 10. The package's chat tool is actually callable in the running
     process: asked to use it, the agent does, and the call is recorded.
 11. The conversation that asked was told the outcome.
+
+The hot-load assertion
+----------------------
+
+**A fresh platform process gives the strongest form of step 8**: the
+package has never been loaded there, so the install registers its
+components live and the report says ``loaded`` with ``needs_restart``
+false.
+
+Run this story a second time in the same platform process — or run
+s061 on the same fixture after it — and the honest answer changes: the
+package's modules are still in ``sys.modules`` from the first install,
+a re-import would return the old module bodies, and the platform
+refuses to re-register, saying so. The suite does not restart the
+platform (restarting a live service from inside a story would interrupt
+real conversations), and uninstalling cannot retract a hot-load, so
+that weaker case is by design rather than a fault.
+
+``support.assert_hot_load`` accepts both, and only those: the live
+load, or the documented module-cache refusal identified by the
+platform's own words. It prints which one it got. Step 10 holds either
+way — a package chat tool registered by the earlier load stays
+registered for the life of the process — though in the weaker case the
+code answering the call is that earlier generation.
 
 Fixture requirement asserted, not assumed: the package must declare no
 ``allowlist_proposals``. Those merge into ``security_policies`` at
@@ -388,14 +414,9 @@ class InstallPackageFromGitRepo(AcceptanceStory):
             f"{block.get('status')!r}, not 'installed'",
             block=block,
         )
-        load = block.get("load") or {}
-        self.assert_that(
-            load.get("loaded") is True and load.get("needs_restart") is False,
-            f"The package did not hot-load into the running process: "
-            f"{load!r}",
-        )
         print(f"     installed v{block.get('version')} "
-              f"hash {block.get('hash_short')}, loaded live ✓")
+              f"hash {block.get('hash_short')}")
+        load_kind = support.assert_hot_load(self, block, name)
 
         # ── 7. Provenance on the install record ─────────────────────
         print("  [7/9] Checking the provenance columns")
@@ -494,8 +515,8 @@ class InstallPackageFromGitRepo(AcceptanceStory):
         elapsed = time.time() - start_ts
         return self.result(
             f"{name} v{block.get('version')} requested in chat, approved on "
-            f"a one-time link, installed by the work queue, hot-loaded and "
-            f"callable in {elapsed:.0f}s"
+            f"a one-time link, installed by the work queue ({load_kind}) "
+            f"and callable in {elapsed:.0f}s"
         )
 
     # ------------------------------------------------------------------
