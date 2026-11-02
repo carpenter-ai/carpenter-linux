@@ -23,7 +23,7 @@ pip install -e .
 
 ## Acceptance Tests
 
-59 end-to-end acceptance stories live in `user_stories/`. Run them against a live server:
+End-to-end acceptance stories live in `user_stories/`, one file per story. Run them against a live server:
 
 ```bash
 python3 user_stories/runner.py          # all stories
